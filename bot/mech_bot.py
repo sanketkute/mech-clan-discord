@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.ext import tasks
 from discord.http import Route
 
-from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board
+from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail
 
 ROOT = Path(__file__).parent.parent  # the repo root, which holds .env, posts/ and the bot's local files
 GUILD = discord.Object(id=1316103480644993116)
@@ -145,6 +145,7 @@ class MechClanBot(discord.Client):
         self.coc = None
         self.state = load_state()
         self.icons = {}
+        self.live_wars = {}  # war id -> latest war JSON, for the board's buttons
 
     async def setup_hook(self):
         await self.tree.sync(guild=GUILD)
@@ -167,6 +168,20 @@ class MechClanBot(discord.Client):
 
     async def on_ready(self):
         log.info('logged in as %s', self.user)
+
+    async def on_interaction(self, interaction):
+        """The war board's buttons (custom id wb:<what>:<war id>): answer privately with the details."""
+        custom_id = (interaction.data or {}).get('custom_id', '')
+        if interaction.type != discord.InteractionType.component or not custom_id.startswith('wb:'):
+            return
+        _, what, war_id = custom_id.split(':', 2)
+        war = self.live_wars.get(war_id)
+        if war is None:
+            await interaction.response.send_message('The bot is still loading this war, or it is too old. '
+                                                    'Try again in a minute.', ephemeral=True)
+            return
+        title, body = detail(war, CLAN, what, self.icon)
+        await interaction.response.send_message(embed=self.card(BLUE, title, body), ephemeral=True)
 
     def channel(self, name):
         return discord.utils.get(self.get_guild(GUILD.id).channels, name=name)
@@ -328,6 +343,7 @@ class MechClanBot(discord.Client):
             us, them = ((war['clan'], war['opponent']) if war['clan']['tag'] == CLAN
                         else (war['opponent'], war['clan']))
             war_id = f"{war['preparationStartTime']}{them['tag']}"
+            self.live_wars[war_id] = war
             attacks = sorted(
                 [(a, True) for m in us.get('members', []) for a in m.get('attacks', [])]
                 + [(a, False) for m in them.get('members', []) for a in m.get('attacks', [])],
@@ -363,7 +379,8 @@ class MechClanBot(discord.Client):
             await self.add_opponent_badge(emoji, them)
         kind = f"CWL round {war['_round']}" if war.get('_cwl_tag') else 'War'
         body = {'flags': IS_COMPONENTS_V2, 'allowed_mentions': {'parse': []},
-                'components': build_board(war, CLAN, self.icon, kind=kind, opponent_icon=self.icons.get(emoji))}
+                'components': build_board(war, CLAN, self.icon, kind=kind, opponent_icon=self.icons.get(emoji),
+                                          war_id=war_id)}
         if board is not None:
             try:
                 await self.http.request(Route('PATCH', '/channels/{channel_id}/messages/{message_id}',
@@ -383,7 +400,7 @@ class MechClanBot(discord.Client):
                                       'order': 0, 'emoji': emoji}
         new = [e for e in attack_log(us, them) if e['attack']['order'] > board['order']]
         chunk = ''
-        for line in [attack_line(e, self.icon, with_order=True) for e in new] + [None]:
+        for line in [attack_line(e, self.icon, in_thread=True) for e in new] + [None]:
             if line is None or len(chunk) + len(line) > 1900:
                 if chunk:
                     await self.http.request(Route('POST', '/channels/{channel_id}/messages', channel_id=board['thread']),

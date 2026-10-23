@@ -29,6 +29,8 @@ Slash commands:
 
 ```
 bot/mech_bot.py          the bot
+bot/war_board.py         the live war board: one message per war, edited every minute, with an attack thread
+bot/phone_check.py       checks that every line of the war board fits on a phone without wrapping
 server-setup/            one-off Discord REST scripts, run by hand
   discord_api.py           small REST client used by the scripts
   build_layout.py          channels, categories, rank roles, permissions, Community settings
