@@ -1,0 +1,527 @@
+"""Mech Clan Bot, run on the owner's laptop (set up 2026-10-23).
+
+Checks mech clan through the official Clash API every minute and posts joins, leaves, promotions, Town Hall
+upgrades and donations to #clan-log, and war and CWL attacks to #war-log. ClashPerk takes up to an hour for the
+same logs right now. Also adds the slash commands /cwl-medals, /bases and /rules.
+
+Needs DISCORD_TOKEN, COC_EMAIL and COC_PASSWORD in .env (COC_* is the developer.clashofclans.com login; coc.py
+makes a new API key whenever the laptop's IP changes). What the bot has already seen is kept in bot_state.json,
+so a restart neither reposts nor misses anything.
+Run from the repo root: .venv\\Scripts\\pythonw.exe bot\\mech_bot.py   (output goes to bot.log in the repo root)"""
+import json
+import logging
+import re
+import socket
+from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional
+
+import coc
+import discord
+from discord import app_commands
+from discord.ext import tasks
+
+ROOT = Path(__file__).parent.parent  # the repo root, which holds .env, posts/ and the bot's local files
+GUILD = discord.Object(id=1316103480644993116)
+CLAN = '#YU9YY8UV'
+STATE_FILE = ROOT / 'bot_state.json'
+RULES_FILE = ROOT / 'posts' / 'rules.md'
+
+ROLES = {'member': 'Member', 'admin': 'Elder', 'coLeader': 'Co-Leader', 'leader': 'Leader'}
+RANK = list(ROLES)
+# Game art comes from ClashKing Assets (assets.clashk.ing, credited in the bot's About Me). Small icons were
+# uploaded as the bot's own emojis on 2026-10-23 (th1-th18, bk, aq, gw, rc, mp, dd, xp, war_star, no_star, ...);
+# bigger pictures are linked straight from the asset site.
+HERO_ICONS = {'Barbarian King': 'bk', 'Archer Queen': 'aq', 'Grand Warden': 'gw', 'Royal Champion': 'rc',
+              'Minion Prince': 'mp', 'Dragon Duke': 'dd'}
+TH_IMAGE = 'https://assets.clashk.ing/buildings/home-village/town_hall/level_{}.webp'
+CWL_ICON = 'https://assets.clashk.ing/bot/cwl/War{}.png'  # Bronze III to Champion I only, e.g. WarCrystalI
+CWL_MEDAL_IMAGE = 'https://assets.clashk.ing/bot/icons/cwl_medal.png'
+# The same CWL league badges are bot emojis named cwl_bronze3 ... cwl_champion1 (uploaded 2026-10-23).
+BADGE_TIERS = ('Bronze', 'Silver', 'Gold', 'Crystal', 'Master', 'Champion')
+ROMAN = {'I': 1, 'II': 2, 'III': 3}
+ALL_LEAGUES = 0
+# Colors: join and win green, leave and loss red, war gold, battle day orange, rank changes amber, donations blue.
+GREEN, RED, GOLD, ORANGE, AMBER, BLUE, PURPLE, GREY = (0x2ECC71, 0xE74C3C, 0xE8B339, 0xE67E22, 0xF1C40F,
+                                                        0x3498DB, 0x9B59B6, 0x99AAB5)
+PLACES = ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th']
+
+# CWL medals, from ClashPerk's src/util/constants.ts: league id -> (name, medals for places 1-8 with 8+ stars,
+# bonus medals for 15v15 and 30v30). Fewer stars pay less: 0 stars 20%, then +10% per star up to 8.
+CWL_LEAGUES = {
+    48000001: ('Bronze League III', [46, 44, 42, 40, 38, 36, 34, 32], (1, 2)),
+    48000002: ('Bronze League II', [58, 56, 54, 52, 50, 48, 46, 44], (1, 2)),
+    48000003: ('Bronze League I', [70, 68, 66, 64, 62, 60, 58, 56], (1, 2)),
+    48000004: ('Silver League III', [88, 85, 82, 79, 76, 73, 70, 67], (1, 2)),
+    48000005: ('Silver League II', [106, 103, 100, 97, 94, 91, 88, 85], (1, 2)),
+    48000006: ('Silver League I', [124, 121, 118, 115, 112, 109, 106, 103], (1, 2)),
+    48000007: ('Gold League III', [148, 144, 140, 136, 132, 128, 124, 120], (2, 4)),
+    48000008: ('Gold League II', [172, 168, 164, 160, 156, 152, 148, 144], (2, 4)),
+    48000009: ('Gold League I', [196, 192, 188, 184, 180, 176, 172, 168], (2, 4)),
+    48000010: ('Crystal League III', [220, 216, 212, 208, 204, 200, 196, 192], (2, 4)),
+    48000011: ('Crystal League II', [244, 240, 236, 232, 228, 224, 220, 216], (2, 4)),
+    48000012: ('Crystal League I', [274, 269, 264, 259, 254, 249, 244, 239], (2, 4)),
+    48000013: ('Master League III', [304, 299, 294, 289, 284, 279, 274, 269], (3, 6)),
+    48000014: ('Master League II', [334, 329, 324, 319, 314, 309, 304, 299], (3, 6)),
+    48000015: ('Master League I', [364, 359, 354, 349, 344, 339, 334, 329], (3, 6)),
+    48000016: ('Champion League III', [388, 384, 380, 376, 372, 368, 364, 360], (4, 0)),
+    48000017: ('Champion League II', [412, 408, 404, 400, 396, 392, 388, 384], (4, 0)),
+    48000018: ('Champion League I', [436, 432, 428, 424, 420, 416, 412, 408], (4, 0)),
+    48000019: ('Titan League III', [454, 451, 448, 445, 442, 439, 436, 433], (5, 0)),
+    48000020: ('Titan League II', [472, 469, 466, 463, 460, 457, 454, 451], (5, 0)),
+    48000021: ('Titan League I', [490, 487, 484, 481, 478, 475, 472, 469], (5, 0)),
+    48000022: ('Legend League', [508, 505, 502, 499, 496, 493, 490, 487], (6, 0)),
+}
+
+log = logging.getLogger('mech_bot')
+
+
+def load_env():
+    env = {}
+    for line in (ROOT / '.env').read_text(encoding='utf-8-sig').splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key, value = line.split('=', 1)
+            env[key.strip()] = value.strip()
+    return env
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {}
+
+
+def save_state(state):
+    tmp = STATE_FILE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
+    tmp.replace(STATE_FILE)
+
+
+def api_time(value):
+    # The Clash API writes times like 20261023T210000.000Z.
+    return datetime.strptime(value, '%Y%m%dT%H%M%S.%fZ').replace(tzinfo=timezone.utc)
+
+
+def stamp(value, style='R'):
+    return f'<t:{int(api_time(value).timestamp())}:{style}>'
+
+
+def game_link(action, tag):
+    return f'https://link.clashofclans.com/en?action={action}&tag={tag.lstrip("#")}'
+
+
+def cwl_icon(league_name):
+    words = league_name.split()  # 'Crystal League I' -> WarCrystalI
+    return CWL_ICON.format(words[0] + words[-1]) if words[0] in ('Bronze', 'Silver', 'Gold', 'Crystal', 'Master',
+                                                                 'Champion') else None
+
+
+def badge(side, size='medium'):
+    return (side.get('badgeUrls') or {}).get(size)
+
+
+def rules_sections():
+    """'### Title' sections of posts/rules.md, with {channel} placeholders left in."""
+    parts = re.split(r'^### +(.+)$', RULES_FILE.read_text(encoding='utf-8'), flags=re.M)
+    return {title.strip(): body.strip() for title, body in zip(parts[1::2], parts[2::2])}
+
+
+class MechClanBot(discord.Client):
+    def __init__(self, env):
+        super().__init__(intents=discord.Intents.default())
+        self.env = env
+        self.tree = app_commands.CommandTree(self)
+        self.coc = None
+        self.state = load_state()
+        self.icons = {}
+
+    async def setup_hook(self):
+        await self.tree.sync(guild=GUILD)
+        try:
+            self.icons = {emoji.name: str(emoji) for emoji in await self.fetch_application_emojis()}
+        except Exception:
+            log.exception('could not load the bot emojis, so cards fall back to text')
+        if not (self.env.get('COC_EMAIL') and self.env.get('COC_PASSWORD')):
+            log.warning('COC_EMAIL or COC_PASSWORD missing from .env, so the clan and war logs are off')
+            return
+        try:
+            self.coc = coc.Client(key_names='Mech Clan Bot', key_count=1,
+                                  load_game_data=coc.LoadGameData(never=True))
+            await self.coc.login(self.env['COC_EMAIL'], self.env['COC_PASSWORD'])
+        except Exception:
+            log.exception('Clash API login failed, so the clan and war logs are off')
+            self.coc = None
+            return
+        self.poll.start()
+
+    async def on_ready(self):
+        log.info('logged in as %s', self.user)
+
+    def channel(self, name):
+        return discord.utils.get(self.get_guild(GUILD.id).channels, name=name)
+
+    def icon(self, name, fallback=''):
+        return self.icons.get(name, fallback)
+
+    def th(self, level):
+        return self.icon(f'th{level}', f'TH{level}')
+
+    def stars(self, n):
+        return self.icon('war_star', '⭐') * n + self.icon('no_star', '☆') * (3 - n)
+
+    def card(self, color, title=None, description=None, url=None):
+        """An embed with the clan's badge and name on top and the time at the bottom."""
+        embed = discord.Embed(color=color, title=title, description=description, url=url,
+                              timestamp=discord.utils.utcnow())
+        embed.set_author(name='mech clan', url=game_link('OpenClanProfile', CLAN), icon_url=self.state.get('badge'))
+        return embed
+
+    @tasks.loop(seconds=60)
+    async def poll(self):
+        for check in (self.check_clan, self.check_war):
+            try:
+                await check()
+            except coc.Maintenance:
+                log.info('Clash API maintenance, skipping %s', check.__name__)
+            except Exception:
+                log.exception('%s failed', check.__name__)
+        save_state(self.state)
+
+    @poll.before_loop
+    async def before_poll(self):
+        await self.wait_until_ready()
+
+    async def check_clan(self):
+        data = await self.coc.http.get_clan(CLAN)
+        self.state['war_league_id'] = (data.get('warLeague') or {}).get('id')
+        self.state['badge'] = badge(data, 'small')
+        now = {m['tag']: {'name': m['name'], 'role': m['role'], 'th': m.get('townHallLevel'),
+                          'given': m['donations'], 'received': m['donationsReceived']} for m in data['memberList']}
+        before = self.state.get('members')
+        self.state['members'] = now
+        if before is None:
+            return  # first run: remember the clan, post nothing
+        channel = self.channel('clan-log')
+        size = f'{len(now)}/50'
+        for tag in now.keys() - before.keys():
+            await channel.send(embed=await self.player_card(tag, now[tag], True, size))
+        for tag in before.keys() - now.keys():
+            await channel.send(embed=await self.player_card(tag, before[tag], False, size))
+
+        ranks, upgrades, donations = [], [], []
+        for tag in now.keys() & before.keys():
+            new, old = now[tag], before[tag]
+            if new['role'] != old['role']:
+                up = RANK.index(new['role']) > RANK.index(old['role'])
+                ranks.append(f"{self.icon('up' if up else 'down')} **{new['name']}** "
+                             f"{'promoted' if up else 'demoted'} to **{ROLES[new['role']]}**")
+            if new['th'] and old['th'] and new['th'] > old['th']:
+                upgrades.append(f"{self.th(old['th'])} ➜ {self.th(new['th'])}  **{new['name']}** is now "
+                                f"**Town Hall {new['th']}**")
+            # Both counters drop back to 0 when the season ends, which gives a negative difference.
+            given, received = new['given'] - old['given'], new['received'] - old['received']
+            if given > 0 or received > 0:
+                donations.append((given, received, new['name']))
+        if ranks:
+            await channel.send(embed=self.card(AMBER, 'Rank change' if len(ranks) == 1 else 'Rank changes',
+                                               '\n'.join(ranks)))
+        if upgrades:
+            await channel.send(embed=self.card(PURPLE, 'Town Hall upgrade', '\n'.join(upgrades)))
+        if donations:
+            lines = []
+            for given, received, name in sorted(donations, reverse=True):
+                parts = ([f"{self.icon('troop')} **{given}** given"] if given > 0 else []) + \
+                        ([f"{self.icon('clan_castle')} {received} received"] if received > 0 else [])
+                lines.append(f"**{name}**  " + '  ·  '.join(parts))
+            embed = self.card(BLUE, 'Donations', '\n'.join(lines)[:4000])
+            embed.set_footer(text=f"Season total: {sum(m['given'] for m in now.values()):,} troops donated")
+            await channel.send(embed=embed)
+
+    async def player_card(self, tag, member, joined, size):
+        try:
+            player = await self.coc.http.get_player(tag)
+        except Exception:
+            log.exception('could not load player %s', tag)
+            player = {}
+        town_hall = player.get('townHallLevel') or member['th']
+        embed = self.card(GREEN if joined else RED, member['name'], url=game_link('OpenPlayerProfile', tag),
+                          description=f"{self.icon('up' if joined else 'down')} "
+                                      f"{'Joined' if joined else 'Left'} the clan · **{size}**")
+        new_clan = player.get('clan') or {}
+        if not joined and new_clan.get('tag') not in (None, CLAN):
+            embed.description += f"\n{self.icon('clan_castle')} Now in **{new_clan['name']}**"
+        if town_hall:
+            embed.set_thumbnail(url=TH_IMAGE.format(town_hall))
+        embed.add_field(name='Town Hall', value=f"{self.th(town_hall)} **{town_hall}**")
+        if player:
+            embed.add_field(name='Level', value=f"{self.icon('xp')} **{player['expLevel']}**")
+            embed.add_field(name='War stars', value=f"{self.icon('war_star')} **{player['warStars']:,}**")
+            heroes = '   '.join(f"{self.icon(HERO_ICONS.get(h['name'], ''), h['name'])} **{h['level']}**"
+                                 for h in player.get('heroes', []) if h.get('village') == 'home')
+            if heroes:
+                embed.add_field(name='Heroes', value=heroes, inline=False)
+            if player.get('warPreference'):
+                opted_in = player['warPreference'] == 'in'
+                embed.add_field(name='War preference', value=f"{self.icon('opt_in' if opted_in else 'opt_out')} "
+                                                             f"{'In' if opted_in else 'Out'}")
+        league = player.get('leagueTier') or {}
+        footer = tag + (f" · was {ROLES.get(member['role'], member['role'])}" if not joined else '')
+        embed.set_footer(text=f"{footer} · {league['name']}" if league.get('name') else footer,
+                         icon_url=(league.get('iconUrls') or {}).get('small'))
+        return embed
+
+    async def current_wars(self):
+        """Our regular war, or our CWL wars that haven't been reported as ended yet."""
+        try:
+            war = await self.coc.http.get_clan_current_war(CLAN)
+        except coc.PrivateWarLog:
+            log.warning('the war log is private, so war logs are off')
+            return []
+        if war.get('state') != 'notInWar':
+            return [war]
+        try:
+            group = await self.coc.http.get_clan_war_league_group(CLAN)
+        except coc.NotFound:
+            return []
+        cwl = self.state.setdefault('cwl', {})
+        if cwl.get('season') != group.get('season'):
+            cwl.clear()
+            cwl.update(season=group.get('season'), ours={}, done=[])
+        wars = []
+        for number, round_ in enumerate(group.get('rounds', []), start=1):
+            tag = cwl['ours'].get(str(number))
+            if tag in cwl['done']:
+                continue
+            if tag:
+                war = await self.coc.http.get_cwl_wars(tag)
+            else:
+                for war_tag in round_['warTags']:
+                    if war_tag == '#0':
+                        continue  # the round isn't drawn yet
+                    war = await self.coc.http.get_cwl_wars(war_tag)
+                    if CLAN in (war['clan']['tag'], war['opponent']['tag']):
+                        cwl['ours'][str(number)] = tag = war_tag
+                        break
+                else:
+                    continue
+            war.update(_cwl_tag=tag, _round=number)
+            wars.append(war)
+        return wars
+
+    async def check_war(self):
+        first_run = 'wars' not in self.state
+        seen_wars = self.state.setdefault('wars', {})
+        for war in await self.current_wars():
+            if war.get('state') in (None, 'notInWar'):
+                continue
+            us, them = ((war['clan'], war['opponent']) if war['clan']['tag'] == CLAN
+                        else (war['opponent'], war['clan']))
+            war_id = f"{war['preparationStartTime']}{them['tag']}"
+            attacks = sorted(
+                [(a, True) for m in us.get('members', []) for a in m.get('attacks', [])]
+                + [(a, False) for m in them.get('members', []) for a in m.get('attacks', [])],
+                key=lambda pair: pair[0]['order'])
+            seen = seen_wars.get(war_id)
+            if seen is None:
+                # On the very first run, don't replay attacks that happened before the bot existed.
+                seen = seen_wars[war_id] = {'state': war['state'] if first_run else None,
+                                            'order': attacks[-1][0]['order'] if first_run and attacks else 0}
+            await self.report_war(war, us, them, seen, attacks)
+            if war['state'] == 'warEnded' and war.get('_cwl_tag'):
+                self.state['cwl']['done'].append(war['_cwl_tag'])
+        # Forget wars that started more than two weeks ago. A war id starts with its 20-character start time.
+        cutoff = datetime.now(timezone.utc) - timedelta(days=14)
+        for war_id in [w for w in seen_wars if api_time(w[:20]) < cutoff]:
+            del seen_wars[war_id]
+
+    async def report_war(self, war, us, them, seen, attacks):
+        channel = self.channel('war-log')
+        cwl = war.get('_cwl_tag')
+        kind = f"CWL round {war['_round']}" if cwl else 'War'
+        size = f"{war['teamSize']} vs {war['teamSize']}"
+        score = (f"{us['name']} {us.get('stars', 0)}⭐ {us.get('destructionPercentage', 0):.1f}%  —  "
+                 f"{them['name']} {them.get('stars', 0)}⭐ {them.get('destructionPercentage', 0):.1f}%")
+        opponent = f"[{them['name']}]({game_link('OpenClanProfile', them['tag'])}) · level {them.get('clanLevel', '?')}"
+        members = {m['tag']: m for m in us.get('members', []) + them.get('members', [])}
+        changed = war['state'] != seen['state']
+        seen['state'] = war['state']
+
+        # Order in the channel: war or battle day announced, then attacks, then the result.
+        if changed and war['state'] in ('preparation', 'inWar'):
+            if war['state'] == 'preparation':
+                embed = self.card(GOLD, f'{kind} declared',
+                                  f"{self.icon('clock')} Battle day starts {stamp(war['startTime'])}")
+                embed.add_field(name='Opponent', value=opponent, inline=False)
+                embed.add_field(name='Size', value=f"{self.icon('people')} {size}")
+                embed.add_field(name='Battle day', value=stamp(war['startTime'], 'f'))
+                embed.set_footer(text='Preparation day: set up your war base')
+            else:
+                embed = self.card(ORANGE, f'{kind}: battle day',
+                                  f"{self.icon('sword')} Use {'your attack' if cwl else 'both attacks'} · "
+                                  f"ends {stamp(war['endTime'])}")
+                embed.add_field(name='Opponent', value=opponent, inline=False)
+                embed.add_field(name='Size', value=f"{self.icon('people')} {size}")
+                embed.add_field(name='Ends', value=stamp(war['endTime'], 'f'))
+                embed.set_footer(text=score)
+            if badge(them):
+                embed.set_thumbnail(url=badge(them))
+            await channel.send(embed=embed)
+
+        new = [pair for pair in attacks if pair[0]['order'] > seen['order']]
+        if new:
+            for ours, title, color in ((True, 'Our attacks', GREEN), (False, 'Their attacks', RED)):
+                lines = []
+                for attack, side in new:
+                    if side != ours:
+                        continue
+                    a, d = members[attack['attackerTag']], members[attack['defenderTag']]
+                    lines.append(f"{self.icon('sword' if ours else 'shield')} **{a['name']}**  "
+                                 f"#{a['mapPosition']} {self.th(a['townhallLevel'])} ➜ "
+                                 f"#{d['mapPosition']} {self.th(d['townhallLevel'])}  "
+                                 f"{self.stars(attack['stars'])} **{attack['destructionPercentage']}%**")
+                if lines:
+                    embed = self.card(color, title, '\n'.join(lines)[:4000])
+                    embed.set_footer(text=score)
+                    await channel.send(embed=embed)
+            seen['order'] = new[-1][0]['order']
+
+        if changed and war['state'] == 'warEnded':
+            ours, theirs = ((side.get('stars', 0), side.get('destructionPercentage', 0)) for side in (us, them))
+            won, tied = ours > theirs, ours == theirs
+            title = 'Tie' if tied else ('Victory' if won else 'Defeat')
+            per_member = war.get('attacksPerMember') or (1 if cwl else 2)
+            used = sum(len(m.get('attacks', [])) for m in us.get('members', []))
+            missed = [f"{m['name']} ({per_member - len(m.get('attacks', []))})" for m in us.get('members', [])
+                      if len(m.get('attacks', [])) < per_member]
+            embed = self.card(GREEN if won else (GREY if tied else RED), f'{title} vs {them["name"]}',
+                              f"{self.icon('trophy') if won else ''} {kind} · {size}".strip())
+            embed.add_field(name='Stars', value=f"{self.icon('war_star')} **{ours[0]}** – {theirs[0]}")
+            embed.add_field(name='Destruction', value=f'**{ours[1]:.1f}%** – {theirs[1]:.1f}%')
+            embed.add_field(name='Attacks used',
+                            value=f"{self.icon('sword')} {used}/{per_member * len(us.get('members', []))}")
+            embed.add_field(name='Missed attacks', inline=False,
+                            value=f"{self.icon('cross')} {', '.join(missed)}"[:1000] if missed
+                            else f"{self.icon('tick')} None, every attack was used!")
+            if badge(them):
+                embed.set_thumbnail(url=badge(them))
+            await channel.send(embed=embed)
+
+
+bot = MechClanBot(load_env())
+
+
+@bot.tree.command(name='cwl-medals', description='CWL medals for each place in a league', guild=GUILD)
+@app_commands.describe(league='Defaults to our current CWL league',
+                       stars='Your total stars this CWL; 8 or more pays full medals')
+@app_commands.choices(league=[app_commands.Choice(name='All leagues', value=ALL_LEAGUES)] +
+                     [app_commands.Choice(name=name, value=lid) for lid, (name, _, _) in CWL_LEAGUES.items()])
+async def cwl_medals(interaction: discord.Interaction, league: Optional[app_commands.Choice[int]] = None,
+                     stars: Optional[app_commands.Range[int, 0, 21]] = None):
+    if league and league.value == ALL_LEAGUES:
+        await interaction.response.send_message(embed=all_leagues_card())
+        return
+    league_id = league.value if league else bot.state.get('war_league_id')
+    if league_id not in CWL_LEAGUES:
+        await interaction.response.send_message('Pick a league: our current CWL league isn\'t known yet.', ephemeral=True)
+        return
+    name, medals, (bonus15, bonus30) = CWL_LEAGUES[league_id]
+    share = min(stars, 8) * 10 + 20 if stars is not None else 100
+    medal, star = bot.icon('cwl_medal'), bot.icon('war_star')
+    if share < 100:
+        description = (f'Medals for each final place with {star} **{stars} stars**, which pays {share}% '
+                       f'(8+ stars pays full medals).')
+    else:
+        description = f'Medals for each final place, for players with {star} **8+ stars** in the week.'
+    embed = bot.card(GOLD, f'CWL medals · {name}', description)
+    if cwl_icon(name):
+        embed.set_thumbnail(url=cwl_icon(name))
+    # Eight places plus the bonus box make a 3 x 3 grid.
+    for place, full in zip(PLACES, medals):
+        embed.add_field(name=f'{place} place', value=f'{medal} **{round(full * share / 100)}**')
+    bonus = '\n'.join(f'{n} in {size}' for n, size in ((bonus15, '15v15'), (bonus30, '30v30')) if n)
+    embed.add_field(name='Bonus medals', value=bonus or 'None in this league')
+    await interaction.response.send_message(embed=embed)
+
+
+def league_badge(name):
+    words = name.split()  # 'Crystal League I' -> the cwl_crystal1 emoji; Titan and Legend have no badge yet
+    if words[0] in BADGE_TIERS and words[-1] in ROMAN:
+        return bot.icon(f'cwl_{words[0].lower()}{ROMAN[words[-1]]}', bot.icon('cwl_medal'))
+    return bot.icon('cwl_medal')
+
+
+def all_leagues_card():
+    """One box per tier (Bronze ... Legend) with 1st-8th place medals per league, so eight boxes plus a hint
+    make the same 3 x 3 grid as the single-league card."""
+    ours = bot.state.get('war_league_id')
+    embed = bot.card(GOLD, 'CWL medals · all leagues',
+                     f"Medals for 1st – 8th place with {bot.icon('war_star')} **8+ stars**. "
+                     f"Bonus medals are for 15v15 / 30v30.")
+    embed.set_thumbnail(url=CWL_MEDAL_IMAGE)
+    tiers = {}
+    for league_id, (name, medals, bonus) in CWL_LEAGUES.items():
+        tiers.setdefault(name.split()[0], []).append((league_id, name, medals, bonus))
+    for tier, leagues in tiers.items():
+        bonus15, bonus30 = leagues[0][3]
+        lines = []
+        for league_id, name, medals, _ in leagues:
+            label = f' {name.split()[-1]}' if len(leagues) > 1 else ''
+            lines.append(f"{league_badge(name)}{label} · **{medals[0]}**–{medals[-1]}"
+                         + ('  ◀ **us**' if league_id == ours else ''))
+        embed.add_field(name=f"{tier} · bonus {bonus15}" + (f" / {bonus30}" if bonus30 else ''), value='\n'.join(lines))
+    embed.add_field(name='One league in detail', value='Run `/cwl-medals` and pick the league.')
+    return embed
+
+
+@bot.tree.command(name='bases', description='Jump to the bases post for a Town Hall', guild=GUILD)
+@app_commands.describe(town_hall='Town Hall level')
+async def bases(interaction: discord.Interaction, town_hall: app_commands.Range[int, 11, 19]):
+    forum = bot.channel('bases')
+    name = f'TH{town_hall} bases'
+    post = discord.utils.get(forum.threads, name=name)
+    reply = interaction.response.send_message
+    if post is None:
+        # A post that went quiet for a week is archived and not cached. Fetching it can take longer than
+        # the 3 seconds Discord allows for a reply, so show "thinking" first and answer as a follow-up.
+        await interaction.response.defer()
+        post = discord.utils.get([t async for t in forum.archived_threads(limit=None)], name=name)
+        reply = interaction.followup.send
+    if post is None:
+        await reply(f'There\'s no TH{town_hall} post in {forum.mention} yet.')
+        return
+    embed = bot.card(BLUE, f'Town Hall {town_hall} bases', f'{bot.th(town_hall)} War, CWL, legend and farming bases. '
+                                                           f'Share yours there with `/layout post`.')
+    if town_hall <= 18:  # no TH19 picture in ClashKing Assets yet
+        embed.set_thumbnail(url=TH_IMAGE.format(town_hall))
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label=f'Open TH{town_hall} bases', url=post.jump_url,
+                                    emoji=bot.icon(f'th{town_hall}') or None))
+    await reply(embed=embed, view=view)
+
+
+@bot.tree.command(name='rules', description='Show one part of the clan rules', guild=GUILD)
+@app_commands.describe(part='Which rules to show')
+@app_commands.choices(part=[app_commands.Choice(name=title, value=title) for title in rules_sections()])
+async def rules(interaction: discord.Interaction, part: app_commands.Choice[str]):
+    channels = {c.name: c.mention for c in interaction.guild.channels}
+    text = re.sub(r'\{([a-z-]+)\}', lambda m: channels.get(m.group(1), m.group(0)), rules_sections()[part.value])
+    embed = bot.card(GOLD, part.value, f"{text}\n\nAll rules: {channels.get('rules', '#rules')}")
+    if bot.state.get('badge'):
+        embed.set_thumbnail(url=bot.state['badge'])
+    await interaction.response.send_message(embed=embed)
+
+
+if __name__ == '__main__':
+    handler = RotatingFileHandler(ROOT / 'bot.log', maxBytes=1_000_000, backupCount=3, encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    # Only one copy may run, or every log would be posted twice. Holding this local port is the lock.
+    lock = socket.socket()
+    try:
+        lock.bind(('127.0.0.1', 47831))
+    except OSError:
+        log.warning('another copy of the bot is already running, exiting')
+        raise SystemExit(0)
+    bot.run(bot.env['DISCORD_TOKEN'], log_handler=None)

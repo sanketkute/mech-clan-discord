@@ -1,0 +1,12 @@
+# Secrets and local data: never commit
+.env
+backup-*.json
+bot_state.json
+bot_state.tmp
+bot.log
+bot.log.*
+CLAUDE.md
+
+# Python
+.venv/
+__pycache__/
