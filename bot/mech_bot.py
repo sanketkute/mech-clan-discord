@@ -8,10 +8,12 @@ Needs DISCORD_TOKEN, COC_EMAIL and COC_PASSWORD in .env (COC_* is the developer.
 makes a new API key whenever the laptop's IP changes). What the bot has already seen is kept in bot_state.json,
 so a restart neither reposts nor misses anything.
 Run from the repo root: .venv\\Scripts\\pythonw.exe bot\\mech_bot.py   (output goes to bot.log in the repo root)"""
+import asyncio
 import json
 import logging
 import re
 import socket
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -21,6 +23,9 @@ import coc
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from discord.http import Route
+
+from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board
 
 ROOT = Path(__file__).parent.parent  # the repo root, which holds .env, posts/ and the bot's local files
 GUILD = discord.Object(id=1316103480644993116)
@@ -33,6 +38,10 @@ RANK = list(ROLES)
 # Game art comes from ClashKing Assets (assets.clashk.ing, credited in the bot's About Me). Small icons were
 # uploaded as the bot's own emojis on 2026-10-23 (th1-th18, bk, aq, gw, rc, mp, dd, xp, war_star, no_star, ...);
 # bigger pictures are linked straight from the asset site.
+# The live war board (war_board.py) is on trial in #leaders since 2026-10-24; the per-attack cards in #war-log
+# keep running until the owner moves the board there.
+BOARD_CHANNEL = 'leaders'
+BADGE_HOST = 'https://api-assets.clashofclans.com/'  # opponent badges are only fetched from Supercell's server
 HERO_ICONS = {'Barbarian King': 'bk', 'Archer Queen': 'aq', 'Grand Warden': 'gw', 'Royal Champion': 'rc',
               'Minion Prince': 'mp', 'Dragon Duke': 'dd'}
 TH_IMAGE = 'https://assets.clashk.ing/buildings/home-village/town_hall/level_{}.webp'
@@ -329,12 +338,85 @@ class MechClanBot(discord.Client):
                 seen = seen_wars[war_id] = {'state': war['state'] if first_run else None,
                                             'order': attacks[-1][0]['order'] if first_run and attacks else 0}
             await self.report_war(war, us, them, seen, attacks)
+            try:
+                await self.update_board(war, us, them, war_id)
+            except Exception:
+                log.exception('war board update failed for %s', war_id)
             if war['state'] == 'warEnded' and war.get('_cwl_tag'):
                 self.state['cwl']['done'].append(war['_cwl_tag'])
         # Forget wars that started more than two weeks ago. A war id starts with its 20-character start time.
         cutoff = datetime.now(timezone.utc) - timedelta(days=14)
         for war_id in [w for w in seen_wars if api_time(w[:20]) < cutoff]:
             del seen_wars[war_id]
+        boards = self.state.get('boards', {})
+        for war_id in [w for w in boards if api_time(w[:20]) < cutoff]:
+            await self.remove_opponent_badge(boards.pop(war_id).get('emoji'))
+
+    async def update_board(self, war, us, them, war_id):
+        """Create or edit the war's board in BOARD_CHANNEL, and post new attacks to the board's thread."""
+        boards = self.state.setdefault('boards', {})
+        board = boards.get(war_id)
+        if board and board.get('final'):
+            return
+        emoji = 'opp_' + them['tag'].lstrip('#').lower()
+        if emoji not in self.icons:
+            await self.add_opponent_badge(emoji, them)
+        kind = f"CWL round {war['_round']}" if war.get('_cwl_tag') else 'War'
+        body = {'flags': IS_COMPONENTS_V2, 'allowed_mentions': {'parse': []},
+                'components': build_board(war, CLAN, self.icon, kind=kind, opponent_icon=self.icons.get(emoji))}
+        if board is not None:
+            try:
+                await self.http.request(Route('PATCH', '/channels/{channel_id}/messages/{message_id}',
+                                              channel_id=board['channel'], message_id=board['message']), json=body)
+            except discord.NotFound:
+                log.warning('war board %s was deleted, posting a new one', board['message'])
+                board = None
+        if board is None:
+            channel = self.channel(BOARD_CHANNEL)
+            message = await self.http.request(Route('POST', '/channels/{channel_id}/messages', channel_id=channel.id),
+                                              json=body)
+            thread = await self.http.request(
+                Route('POST', '/channels/{channel_id}/messages/{message_id}/threads',
+                      channel_id=channel.id, message_id=message['id']),
+                json={'name': f"Attack log vs {them['name']}"[:100], 'auto_archive_duration': 10080})
+            board = boards[war_id] = {'channel': str(channel.id), 'message': message['id'], 'thread': thread['id'],
+                                      'order': 0, 'emoji': emoji}
+        new = [e for e in attack_log(us, them) if e['attack']['order'] > board['order']]
+        chunk = ''
+        for line in [attack_line(e, self.icon, with_order=True) for e in new] + [None]:
+            if line is None or len(chunk) + len(line) > 1900:
+                if chunk:
+                    await self.http.request(Route('POST', '/channels/{channel_id}/messages', channel_id=board['thread']),
+                                            json={'content': chunk, 'allowed_mentions': {'parse': []}})
+                chunk = ''
+            if line:
+                chunk += line + '\n'
+        if new:
+            board['order'] = new[-1]['attack']['order']
+        board['final'] = war['state'] == 'warEnded'
+
+    async def add_opponent_badge(self, name, them):
+        """Upload the opponent's badge as a bot emoji for the board's "vs" header."""
+        url = (them.get('badgeUrls') or {}).get('medium', '')
+        if not url.startswith(BADGE_HOST):
+            return
+        try:
+            data = await asyncio.to_thread(lambda: urllib.request.urlopen(url, timeout=20).read())
+            if data[:8] != b'\x89PNG\r\n\x1a\n' or len(data) > 256 * 1024:
+                log.warning('opponent badge %s is not a small PNG, skipping', url)
+                return
+            self.icons[name] = str(await self.create_application_emoji(name=name, image=data))
+        except Exception:
+            log.exception('could not add the opponent badge %s', name)
+
+    async def remove_opponent_badge(self, name):
+        """Delete an old opponent badge emoji once no remaining board uses it."""
+        if not name or any(b.get('emoji') == name for b in self.state.get('boards', {}).values()):
+            return
+        for emoji in await self.fetch_application_emojis():
+            if emoji.name == name:
+                await emoji.delete()
+        self.icons.pop(name, None)
 
     async def report_war(self, war, us, them, seen, attacks):
         channel = self.channel('war-log')
