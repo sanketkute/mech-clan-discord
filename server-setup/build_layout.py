@@ -165,7 +165,7 @@ def main():
                     built[name] = ensure_channel(existing, name, ch_type, cat['id'], topic, access, roles, pos)
 
     call('PATCH', f'/guilds/{GUILD}', {
-        'system_channel_id': built['welcome']['id'],
+        'system_channel_id': built['chat']['id'],  # join messages; #welcome stays an info page (owner, 2026-10-24)
         'system_channel_flags': (1 << 2) | (1 << 3),  # hide Discord's setup tips and sticker-reply prompts
         'default_message_notifications': 1,  # only @mentions notify by default
     }, REASON)
