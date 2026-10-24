@@ -25,7 +25,7 @@ from discord import app_commands
 from discord.ext import tasks
 from discord.http import Route
 
-from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail
+from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail, plural
 
 ROOT = Path(__file__).parent.parent  # the repo root, which holds .env, posts/ and the bot's local files
 GUILD = discord.Object(id=1316103480644993116)
@@ -42,6 +42,7 @@ RANK = list(ROLES)
 # keep running until the owner moves the board there.
 BOARD_CHANNEL = 'leaders'
 BADGE_HOST = 'https://api-assets.clashofclans.com/'  # opponent badges are only fetched from Supercell's server
+SUPPRESS_NOTIFICATIONS = 1 << 12  # message flag, the same as starting a message with @silent
 HERO_ICONS = {'Barbarian King': 'bk', 'Archer Queen': 'aq', 'Grand Warden': 'gw', 'Royal Champion': 'rc',
               'Minion Prince': 'mp', 'Dragon Duke': 'dd'}
 TH_IMAGE = 'https://assets.clashk.ing/buildings/home-village/town_hall/level_{}.webp'
@@ -192,11 +193,10 @@ class MechClanBot(discord.Client):
     def th(self, level):
         return self.icon(f'th{level}', f'TH{level}')
 
-    def stars(self, n):
-        return self.icon('war_star', '⭐') * n + self.icon('no_star', '☆') * (3 - n)
-
     def card(self, color, title=None, description=None, url=None):
-        """An embed with the clan's badge and name on top and the time at the bottom."""
+        """An embed with the clan's badge and name on top and the time at the bottom.
+        A phone notification shows the title and description as plain text ("title: description"), with bot
+        emojis, bold and <t:> timestamps left raw. So both stay plain words; icons go in fields and pictures."""
         embed = discord.Embed(color=color, title=title, description=description, url=url,
                               timestamp=discord.utils.utcnow())
         embed.set_author(name='mech clan', url=game_link('OpenClanProfile', CLAN), icon_url=self.state.get('badge'))
@@ -239,11 +239,9 @@ class MechClanBot(discord.Client):
             new, old = now[tag], before[tag]
             if new['role'] != old['role']:
                 up = RANK.index(new['role']) > RANK.index(old['role'])
-                ranks.append(f"{self.icon('up' if up else 'down')} **{new['name']}** "
-                             f"{'promoted' if up else 'demoted'} to **{ROLES[new['role']]}**")
+                ranks.append(f"{new['name']} {'promoted' if up else 'demoted'} to {ROLES[new['role']]}")
             if new['th'] and old['th'] and new['th'] > old['th']:
-                upgrades.append(f"{self.th(old['th'])} ➜ {self.th(new['th'])}  **{new['name']}** is now "
-                                f"**Town Hall {new['th']}**")
+                upgrades.append((old['th'], new['th'], new['name']))
             # Both counters drop back to 0 when the season ends, which gives a negative difference.
             given, received = new['given'] - old['given'], new['received'] - old['received']
             if given > 0 or received > 0:
@@ -252,14 +250,32 @@ class MechClanBot(discord.Client):
             await channel.send(embed=self.card(AMBER, 'Rank change' if len(ranks) == 1 else 'Rank changes',
                                                '\n'.join(ranks)))
         if upgrades:
-            await channel.send(embed=self.card(PURPLE, 'Town Hall upgrade', '\n'.join(upgrades)))
+            embed = self.card(PURPLE, 'Town Hall upgrade' if len(upgrades) == 1 else 'Town Hall upgrades',
+                              '\n'.join(f"{name} is now Town Hall {new}" for old, new, name in upgrades))
+            embed.add_field(name='Town Hall', value='\n'.join(
+                f"{self.th(old)} ➜ {self.th(new)}" + (f"  {name}" if len(upgrades) > 1 else '')
+                for old, new, name in upgrades)[:1024])
+            if len(upgrades) == 1:
+                embed.set_thumbnail(url=TH_IMAGE.format(upgrades[0][1]))
+            await channel.send(embed=embed)
         if donations:
             lines = []
             for given, received, name in sorted(donations, reverse=True):
                 parts = ([f"{self.icon('troop')} **{given}** given"] if given > 0 else []) + \
                         ([f"{self.icon('clan_castle')} {received} received"] if received > 0 else [])
                 lines.append(f"**{name}**  " + '  ·  '.join(parts))
-            embed = self.card(BLUE, 'Donations', '\n'.join(lines)[:4000])
+            shown = []
+            for line in lines:
+                if len('\n'.join(shown + [line])) > 1000:  # a field holds 1024 characters
+                    shown.append(f"and {len(lines) - len(shown)} more")
+                    break
+                shown.append(line)
+            given = sum(g for g, _, _ in donations if g > 0)
+            givers = sum(1 for g, _, _ in donations if g > 0)
+            summary = (f"{plural(givers, 'member')} donated {plural(given, 'troop')}" if given
+                       else f"{plural(sum(r for _, r, _ in donations if r > 0), 'troop')} received")
+            embed = self.card(BLUE, 'Donations', summary)
+            embed.add_field(name='By member', value='\n'.join(shown), inline=False)
             embed.set_footer(text=f"Season total: {sum(m['given'] for m in now.values()):,} troops donated")
             await channel.send(embed=embed)
 
@@ -271,11 +287,10 @@ class MechClanBot(discord.Client):
             player = {}
         town_hall = player.get('townHallLevel') or member['th']
         embed = self.card(GREEN if joined else RED, member['name'], url=game_link('OpenPlayerProfile', tag),
-                          description=f"{self.icon('up' if joined else 'down')} "
-                                      f"{'Joined' if joined else 'Left'} the clan · **{size}**")
+                          description=f"{'Joined' if joined else 'Left'} the clan · {size}")
         new_clan = player.get('clan') or {}
         if not joined and new_clan.get('tag') not in (None, CLAN):
-            embed.description += f"\n{self.icon('clan_castle')} Now in **{new_clan['name']}**"
+            embed.description += f"\nNow in {new_clan['name']}"
         if town_hall:
             embed.set_thumbnail(url=TH_IMAGE.format(town_hall))
         embed.add_field(name='Town Hall', value=f"{self.th(town_hall)} **{town_hall}**")
@@ -390,8 +405,10 @@ class MechClanBot(discord.Client):
                 board = None
         if board is None:
             channel = self.channel(BOARD_CHANNEL)
+            # Posted silently: the War declared, Battle day and result cards carry the notifications, with plain
+            # text. Only a new message can be silent, so the edits keep just the Components V2 flag.
             message = await self.http.request(Route('POST', '/channels/{channel_id}/messages', channel_id=channel.id),
-                                              json=body)
+                                              json={**body, 'flags': IS_COMPONENTS_V2 | SUPPRESS_NOTIFICATIONS})
             thread = await self.http.request(
                 Route('POST', '/channels/{channel_id}/messages/{message_id}/threads',
                       channel_id=channel.id, message_id=message['id']),
@@ -450,19 +467,18 @@ class MechClanBot(discord.Client):
         # Order in the channel: war or battle day announced, then attacks, then the result.
         if changed and war['state'] in ('preparation', 'inWar'):
             if war['state'] == 'preparation':
-                embed = self.card(GOLD, f'{kind} declared',
-                                  f"{self.icon('clock')} Battle day starts {stamp(war['startTime'])}")
+                embed = self.card(GOLD, f'{kind} declared', f"Against {them['name']} · {size}")
                 embed.add_field(name='Opponent', value=opponent, inline=False)
-                embed.add_field(name='Size', value=f"{self.icon('people')} {size}")
-                embed.add_field(name='Battle day', value=stamp(war['startTime'], 'f'))
+                embed.add_field(name='Battle day', value=f"{self.icon('clock')} {stamp(war['startTime'])} · "
+                                                         f"{stamp(war['startTime'], 't')}")
                 embed.set_footer(text='Preparation day: set up your war base')
             else:
-                embed = self.card(ORANGE, f'{kind}: battle day',
-                                  f"{self.icon('sword')} Use {'your attack' if cwl else 'both attacks'} · "
-                                  f"ends {stamp(war['endTime'])}")
+                embed = self.card(ORANGE, 'Battle day' + (f' · {kind}' if cwl else ''),
+                                  f"Against {them['name']} · use {'your attack' if cwl else 'both attacks'}")
                 embed.add_field(name='Opponent', value=opponent, inline=False)
                 embed.add_field(name='Size', value=f"{self.icon('people')} {size}")
-                embed.add_field(name='Ends', value=stamp(war['endTime'], 'f'))
+                embed.add_field(name='Ends', value=f"{self.icon('clock')} {stamp(war['endTime'])} · "
+                                                   f"{stamp(war['endTime'], 't')}")
                 embed.set_footer(text=score)
             if badge(them):
                 embed.set_thumbnail(url=badge(them))
@@ -470,16 +486,16 @@ class MechClanBot(discord.Client):
 
         new = [pair for pair in attacks if pair[0]['order'] > seen['order']]
         if new:
-            for ours, title, color in ((True, 'Our attacks', GREEN), (False, 'Their attacks', RED)):
+            for ours, title, color in ((True, 'Our attacks', GREEN), (False, 'Enemy attacks', RED)):
                 lines = []
                 for attack, side in new:
                     if side != ours:
                         continue
+                    # Plain text with standard stars, which a phone notification shows as they are.
                     a, d = members[attack['attackerTag']], members[attack['defenderTag']]
-                    lines.append(f"{self.icon('sword' if ours else 'shield')} **{a['name']}**  "
-                                 f"#{a['mapPosition']} {self.th(a['townhallLevel'])} ➜ "
-                                 f"#{d['mapPosition']} {self.th(d['townhallLevel'])}  "
-                                 f"{self.stars(attack['stars'])} **{attack['destructionPercentage']}%**")
+                    lines.append(f"{a['name']} #{a['mapPosition']} ➜ #{d['mapPosition']} · "
+                                 f"{'★' * attack['stars']}{'☆' * (3 - attack['stars'])} "
+                                 f"{attack['destructionPercentage']}%")
                 if lines:
                     embed = self.card(color, title, '\n'.join(lines)[:4000])
                     embed.set_footer(text=score)
@@ -489,15 +505,14 @@ class MechClanBot(discord.Client):
         if changed and war['state'] == 'warEnded':
             ours, theirs = ((side.get('stars', 0), side.get('destructionPercentage', 0)) for side in (us, them))
             won, tied = ours > theirs, ours == theirs
-            title = 'Tie' if tied else ('Victory' if won else 'Defeat')
+            verb = 'drew with' if tied else ('beat' if won else 'lost to')  # the same headline as the war board
             per_member = war.get('attacksPerMember') or (1 if cwl else 2)
             used = sum(len(m.get('attacks', [])) for m in us.get('members', []))
             missed = [f"{m['name']} ({per_member - len(m.get('attacks', []))})" for m in us.get('members', [])
                       if len(m.get('attacks', [])) < per_member]
-            embed = self.card(GREEN if won else (GREY if tied else RED), f'{title} vs {them["name"]}',
-                              f"{self.icon('trophy') if won else ''} {kind} · {size}".strip())
-            embed.add_field(name='Stars', value=f"{self.icon('war_star')} **{ours[0]}** – {theirs[0]}")
-            embed.add_field(name='Destruction', value=f'**{ours[1]:.1f}%** – {theirs[1]:.1f}%')
+            embed = self.card(GREEN if won else (GREY if tied else RED), f"We {verb} {them['name']}",
+                              f"{ours[0]} – {theirs[0]} stars · {ours[1]:.1f}% – {theirs[1]:.1f}%")
+            embed.set_footer(text=f'{kind} · {size}')
             embed.add_field(name='Attacks used',
                             value=f"{self.icon('sword')} {used}/{per_member * len(us.get('members', []))}")
             embed.add_field(name='Missed attacks', inline=False,
