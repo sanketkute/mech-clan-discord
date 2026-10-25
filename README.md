@@ -13,7 +13,8 @@ Join us: [discord.gg/fjDTMZ3NYF](https://discord.gg/fjDTMZ3NYF)
 It checks the clan through the official Clash of Clans API every minute and posts:
 
 - **#clan-log:** joins and leaves (as player cards with Town Hall, level, war stars and heroes), rank changes,
-  Town Hall upgrades and donations
+  Town Hall upgrades, and one live donation board a day, edited as members donate (`DONATION_LOG` in
+  `bot/mech_bot.py` switches it off)
 - **#war-log:** war declared, battle day, every attack (ours and theirs) and the result with missed attacks,
   for regular wars and Clan War League
 
@@ -30,7 +31,8 @@ Slash commands:
 ```
 bot/mech_bot.py          the bot
 bot/war_board.py         the live war board: one message per war, edited every minute, with an attack thread
-bot/phone_check.py       checks that every line of the war board fits on a phone without wrapping
+bot/donation_board.py    the daily donation board: top donors of the day, posted silently in #clan-log
+bot/phone_check.py       checks that every line of both boards fits on a phone without wrapping
 server-setup/            one-off Discord REST scripts, run by hand
   discord_api.py           small REST client used by the scripts
   build_layout.py          channels, categories, rank roles, permissions, Community settings

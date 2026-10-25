@@ -1,8 +1,10 @@
 """Mech Clan Bot, run on the owner's laptop (set up 2026-10-23).
 
-Checks mech clan through the official Clash API every minute and posts joins, leaves, promotions, Town Hall
-upgrades and donations to #clan-log, and war and CWL attacks to #war-log. ClashPerk takes up to an hour for the
-same logs right now. Also adds the slash commands /cwl-medals, /bases and /rules.
+Checks mech clan through the official Clash API every minute and posts joins, leaves, promotions and Town Hall
+upgrades to #clan-log, plus one live donation board a day (DONATION_LOG), and war and CWL attacks to #war-log.
+Town Hall levels come from each member's profile, which updates sooner than the clan's member list.
+ClashPerk takes up to an hour for the same logs right now. Also adds the slash commands /cwl-medals, /bases and
+/rules.
 
 Needs DISCORD_TOKEN, COC_EMAIL and COC_PASSWORD in .env (COC_* is the developer.clashofclans.com login; coc.py
 makes a new API key whenever the laptop's IP changes). What the bot has already seen is kept in bot_state.json,
@@ -25,7 +27,8 @@ from discord import app_commands
 from discord.ext import tasks
 from discord.http import Route
 
-from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail, plural
+from donation_board import build_donation_board
+from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail
 
 ROOT = Path(__file__).parent.parent  # the repo root, which holds .env, posts/ and the bot's local files
 GUILD = discord.Object(id=1316103480644993116)
@@ -43,6 +46,9 @@ RANK = list(ROLES)
 BOARD_CHANNEL = 'leaders'
 BADGE_HOST = 'https://api-assets.clashofclans.com/'  # opponent badges are only fetched from Supercell's server
 SUPPRESS_NOTIFICATIONS = 1 << 12  # message flag, the same as starting a message with @silent
+# The live daily donation board in #clan-log (donation_board.py, the owner's pick on 2026-10-24). Donations are
+# counted even while it's off, so turning it back on picks up from then instead of posting everything at once.
+DONATION_LOG = True
 HERO_ICONS = {'Barbarian King': 'bk', 'Archer Queen': 'aq', 'Grand Warden': 'gw', 'Royal Champion': 'rc',
               'Minion Prince': 'mp', 'Dragon Duke': 'dd'}
 TH_IMAGE = 'https://assets.clashk.ing/buildings/home-village/town_hall/level_{}.webp'
@@ -221,9 +227,14 @@ class MechClanBot(discord.Client):
         data = await self.coc.http.get_clan(CLAN)
         self.state['war_league_id'] = (data.get('warLeague') or {}).get('id')
         self.state['badge'] = badge(data, 'small')
-        now = {m['tag']: {'name': m['name'], 'role': m['role'], 'th': m.get('townHallLevel'),
-                          'given': m['donations'], 'received': m['donationsReceived']} for m in data['memberList']}
         before = self.state.get('members')
+        profiles = await self.profiles([m['tag'] for m in data['memberList']])
+        now = {m['tag']: {'name': m['name'], 'role': m['role'],
+                          # A Town Hall never goes down, so the highest of profile, clan list and last value is
+                          # right even when a profile fails to load and the clan list is behind.
+                          'th': max((profiles.get(m['tag'], {}).get('townHallLevel') or 0, m.get('townHallLevel') or 0,
+                                     ((before or {}).get(m['tag']) or {}).get('th') or 0)) or None,
+                          'given': m['donations'], 'received': m['donationsReceived']} for m in data['memberList']}
         self.state['members'] = now
         if before is None:
             return  # first run: remember the clan, post nothing
@@ -242,10 +253,12 @@ class MechClanBot(discord.Client):
                 ranks.append(f"{new['name']} {'promoted' if up else 'demoted'} to {ROLES[new['role']]}")
             if new['th'] and old['th'] and new['th'] > old['th']:
                 upgrades.append((old['th'], new['th'], new['name']))
-            # Both counters drop back to 0 when the season ends, which gives a negative difference.
-            given, received = new['given'] - old['given'], new['received'] - old['received']
-            if given > 0 or received > 0:
-                donations.append((given, received, new['name']))
+            # Both counters drop back to 0 when the season ends, which gives a negative difference. A member saved
+            # without counters (by an older version) counts as no change.
+            given = new['given'] - old.get('given', new['given'])
+            received = new['received'] - old.get('received', new['received'])
+            if DONATION_LOG and (given > 0 or received > 0):
+                donations.append((tag, max(given, 0), max(received, 0)))
         if ranks:
             await channel.send(embed=self.card(AMBER, 'Rank change' if len(ranks) == 1 else 'Rank changes',
                                                '\n'.join(ranks)))
@@ -259,25 +272,45 @@ class MechClanBot(discord.Client):
                 embed.set_thumbnail(url=TH_IMAGE.format(upgrades[0][1]))
             await channel.send(embed=embed)
         if donations:
-            lines = []
-            for given, received, name in sorted(donations, reverse=True):
-                parts = ([f"{self.icon('troop')} **{given}** given"] if given > 0 else []) + \
-                        ([f"{self.icon('clan_castle')} {received} received"] if received > 0 else [])
-                lines.append(f"**{name}**  " + '  ·  '.join(parts))
-            shown = []
-            for line in lines:
-                if len('\n'.join(shown + [line])) > 1000:  # a field holds 1024 characters
-                    shown.append(f"and {len(lines) - len(shown)} more")
-                    break
-                shown.append(line)
-            given = sum(g for g, _, _ in donations if g > 0)
-            givers = sum(1 for g, _, _ in donations if g > 0)
-            summary = (f"{plural(givers, 'member')} donated {plural(given, 'troop')}" if given
-                       else f"{plural(sum(r for _, r, _ in donations if r > 0), 'troop')} received")
-            embed = self.card(BLUE, 'Donations', summary)
-            embed.add_field(name='By member', value='\n'.join(shown), inline=False)
-            embed.set_footer(text=f"Season total: {sum(m['given'] for m in now.values()):,} troops donated")
-            await channel.send(embed=embed)
+            await self.update_donation_board(donations, now)
+
+    async def profiles(self, tags):
+        """Each member's own profile. Its Town Hall updates sooner than the clan's member list: on 2026-10-24
+        Yuki's TH12 reached the list an hour after ClashPerk, which reads profiles, had posted it. One request per
+        member every minute; a profile that fails to load is left out."""
+        results = await asyncio.gather(*(self.coc.http.get_player(tag) for tag in tags), return_exceptions=True)
+        for tag, result in zip(tags, results):
+            if isinstance(result, Exception):
+                log.warning('could not load profile %s: %r', tag, result)
+        return {tag: result for tag, result in zip(tags, results) if isinstance(result, dict)}
+
+    async def update_donation_board(self, donations, members):
+        """Add this minute's donations (tag, given, received) to today's board in #clan-log. The first donation of
+        the day (laptop time) posts a new board, silently; after that it is edited."""
+        today = datetime.now().astimezone()
+        board = self.state.get('donation_board')
+        if not board or board['date'] != today.date().isoformat():
+            board = self.state['donation_board'] = {'date': today.date().isoformat(), 'members': {}}
+        for tag, given, received in donations:
+            row = board['members'].setdefault(tag, {'given': 0, 'received': 0})
+            row['name'] = members[tag]['name']
+            row['given'] += given
+            row['received'] += received
+        rows = [(row['name'], row['given'], row['received']) for row in board['members'].values()]
+        body = {'flags': IS_COMPONENTS_V2, 'allowed_mentions': {'parse': []},
+                'components': build_donation_board(rows, sum(m['given'] for m in members.values()), self.icon,
+                                                   today, int(today.timestamp()))}
+        if board.get('message'):
+            try:
+                await self.http.request(Route('PATCH', '/channels/{channel_id}/messages/{message_id}',
+                                              channel_id=board['channel'], message_id=board['message']), json=body)
+                return
+            except discord.NotFound:
+                log.warning('donation board %s was deleted, posting a new one', board['message'])
+        channel = self.channel('clan-log')
+        message = await self.http.request(Route('POST', '/channels/{channel_id}/messages', channel_id=channel.id),
+                                          json={**body, 'flags': IS_COMPONENTS_V2 | SUPPRESS_NOTIFICATIONS})
+        board['channel'], board['message'] = str(channel.id), message['id']
 
     async def player_card(self, tag, member, joined, size):
         try:

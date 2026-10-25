@@ -1,4 +1,4 @@
-"""Checks that the war board fits on a phone before it goes out. The owner's rule (2026-10-24): always check how
+"""Checks that the war board and the donation board fit on a phone before they go out. The owner's rule (2026-10-24): always check how
 a card looks on a small screen, not just on a desktop.
 
 It estimates each line's width in units: a letter, digit, space or sign is 1 and an emoji (custom or Unicode) is 4.5.
@@ -13,6 +13,7 @@ import sys
 from datetime import datetime, timezone
 
 import war_board as wb
+from donation_board import build_donation_board
 
 LIMIT = 44
 EMOJI = 4.5
@@ -104,6 +105,9 @@ def main():
         wraps += check(board, f'board, {state}', show='-v' in sys.argv)
     log = wb.attack_log(war['clan'], war['opponent'])
     wraps += check([wb.text('\n'.join(wb.attack_line(e, icon, in_thread=True) for e in log))], 'thread lines',
+                   show='-v' in sys.argv)
+    donors = [(m['name'], 9999 - 700 * i, 9999 - 500 * i) for i, m in enumerate(war['clan']['members'])]
+    wraps += check(build_donation_board(donors, 123456, icon, now, int(now.timestamp())), 'donation board',
                    show='-v' in sys.argv)
     sys.exit(1 if wraps else 0)
 
