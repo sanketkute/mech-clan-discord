@@ -21,6 +21,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import coc
 import discord
 from discord import app_commands
@@ -46,6 +47,12 @@ RANK = list(ROLES)
 BOARD_CHANNEL = 'leaders'
 BADGE_HOST = 'https://api-assets.clashofclans.com/'  # opponent badges are only fetched from Supercell's server
 SUPPRESS_NOTIFICATIONS = 1 << 12  # message flag, the same as starting a message with @silent
+# Health (owner's yes, 2026-11-02): the bot's status turns yellow after STATUS_AFTER of failed checks, and #leaders
+# gets an alert after ALERT_AFTER.
+STATUS_AFTER, ALERT_AFTER = timedelta(minutes=5), timedelta(minutes=10)
+MAINTENANCE = 'Clash of Clans is down for maintenance'
+WATCHING = discord.Activity(type=discord.ActivityType.watching, name='mech clan')
+IP_ADDRESS = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b')
 # The live daily donation board in #clan-log (donation_board.py, the owner's pick on 2026-10-24). Donations are
 # counted even while it's off, so turning it back on picks up from then instead of posting everything at once.
 DONATION_LOG = True
@@ -128,6 +135,26 @@ def game_link(action, tag):
     return f'https://link.clashofclans.com/en?action={action}&tag={tag.lstrip("#")}'
 
 
+def clock(moment):
+    """Laptop time like "17:21", with the weekday ("Mon 17:21") when it isn't today."""
+    local = moment.astimezone()
+    return f'{local:%H:%M}' if local.date() == datetime.now().astimezone().date() else f'{local:%a %H:%M}'
+
+
+def duration(span):
+    minutes = max(1, round(span.total_seconds() / 60))
+    return f'{minutes} min' if minutes < 60 else f'{minutes // 60} h {minutes % 60} min'
+
+
+def failure_reason(error):
+    """A plain reason for a failed check, for the #leaders alert."""
+    if isinstance(error, coc.Forbidden):
+        return 'Supercell refused the API key'
+    if isinstance(error, (aiohttp.ClientConnectionError, socket.gaierror, asyncio.TimeoutError)):
+        return "The laptop can't reach the Clash API (no internet?)"
+    return f'Unexpected error: {type(error).__name__}'
+
+
 def cwl_icon(league_name):
     words = league_name.split()  # 'Crystal League I' -> WarCrystalI
     return CWL_ICON.format(words[0] + words[-1]) if words[0] in ('Bronze', 'Silver', 'Gold', 'Crystal', 'Master',
@@ -146,8 +173,9 @@ def rules_sections():
 
 class MechClanBot(discord.Client):
     def __init__(self, env):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(intents=discord.Intents.default(), activity=WATCHING)
         self.env = env
+        self.presence = None  # (status, text) last sent to Discord
         self.tree = app_commands.CommandTree(self)
         self.coc = None
         self.state = load_state()
@@ -175,6 +203,7 @@ class MechClanBot(discord.Client):
 
     async def on_ready(self):
         log.info('logged in as %s', self.user)
+        self.presence = None  # a new gateway session starts from WATCHING, so the next poll sends the status again
 
     async def on_interaction(self, interaction):
         """The war board's buttons (custom id wb:<what>:<war id>): answer privately with the details."""
@@ -210,14 +239,56 @@ class MechClanBot(discord.Client):
 
     @tasks.loop(seconds=60)
     async def poll(self):
+        failure = None  # (short reason, details) of the first check that failed
         for check in (self.check_clan, self.check_war):
             try:
                 await check()
             except coc.Maintenance:
                 log.info('Clash API maintenance, skipping %s', check.__name__)
-            except Exception:
+                failure = failure or (MAINTENANCE, 'The Clash API is down for maintenance.')
+            except Exception as error:
                 log.exception('%s failed', check.__name__)
+                failure = failure or (failure_reason(error), str(error))
+        await self.update_health(failure)
         save_state(self.state)
+
+    async def update_health(self, failure):
+        """Make a run of failed checks visible (owner's request after a silent 30-hour outage, 2026-11-02): after
+        STATUS_AFTER the bot's status turns yellow, after ALERT_AFTER #leaders gets an alert (not for maintenance,
+        which everyone sees in the game), and the first good check after an alert posts an all-clear."""
+        now = datetime.now(timezone.utc)
+        health = self.state.setdefault('health', {})
+        if failure is None:
+            if health.get('alerted'):
+                down = now - datetime.fromisoformat(health['since'])
+                await self.channel('leaders').send(embed=self.card(
+                    GREEN, 'Mech Clan Bot is back', f'Checks work again after {duration(down)}. Clan and war events '
+                                                    'from that time may be late or missing.'))
+            self.state['health'] = {}
+            await self.show_health()
+            return
+        reason, details = failure
+        since = datetime.fromisoformat(health.setdefault('since', now.isoformat()))
+        if now - since >= STATUS_AFTER:
+            await self.show_health(reason, since)
+        if now - since >= ALERT_AFTER and reason != MAINTENANCE and not health.get('alerted'):
+            embed = self.card(RED, "Mech Clan Bot can't read the game",
+                              f'Clan and war checks have failed since {clock(since)}. {reason}.')
+            embed.add_field(name='Details', value=IP_ADDRESS.sub('<laptop IP>', details)[:1000] or '-')
+            await self.channel('leaders').send(embed=embed)
+            health['alerted'] = True
+
+    async def show_health(self, reason=None, since=None):
+        """Green "Watching mech clan" while checks work, yellow with how long they've failed otherwise. Only sent
+        when it changes."""
+        if reason is None:
+            status, activity = discord.Status.online, WATCHING
+        else:
+            text = 'Clash maintenance' if reason == MAINTENANCE else 'No game data'
+            status, activity = discord.Status.idle, discord.CustomActivity(name=f'{text} since {clock(since)}')
+        if (status, activity.name) != self.presence:
+            self.presence = status, activity.name
+            await self.change_presence(status=status, activity=activity)
 
     @poll.before_loop
     async def before_poll(self):

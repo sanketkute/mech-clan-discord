@@ -18,6 +18,10 @@ It checks the clan through the official Clash of Clans API every minute and post
 - **#war-log:** war declared, battle day, every attack (ours and theirs) and the result with missed attacks,
   for regular wars and Clan War League
 
+Its Discord status shows whether it can read the game: green "Watching mech clan" while the checks work, yellow
+"No game data since 17:21" after 5 minutes of failed checks. After 10 minutes it also posts an alert in #leaders,
+and an all-clear once the checks work again.
+
 Slash commands:
 
 | Command | What it does |
