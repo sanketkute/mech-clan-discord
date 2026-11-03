@@ -268,6 +268,7 @@ class MechClanBot(discord.Client):
             await self.show_health()
             return
         reason, details = failure
+        health['reason'] = reason  # for bot/status.py
         since = datetime.fromisoformat(health.setdefault('since', now.isoformat()))
         if now - since >= STATUS_AFTER:
             await self.show_health(reason, since)

@@ -20,7 +20,9 @@ It checks the clan through the official Clash of Clans API every minute and post
 
 Its Discord status shows whether it can read the game: green "Watching mech clan" while the checks work, yellow
 "No game data since 17:21" after 5 minutes of failed checks. After 10 minutes it also posts an alert in #leaders,
-and an all-clear once the checks work again.
+and an all-clear once the checks work again. On the laptop itself, `mechbot` shows whether the bot is running, when it
+last checked the game, its Discord connection and recent errors; `mechbot restart` restarts it and `mechbot log`
+shows the end of its log. That needs the repo folder on the PATH; without it, run `mechbot.cmd` from the repo.
 
 Slash commands:
 
@@ -36,6 +38,8 @@ Slash commands:
 bot/mech_bot.py          the bot
 bot/war_board.py         the live war board: one message per war, edited every minute, with an attack thread
 bot/donation_board.py    the daily donation board: top donors of the day, posted silently in #clan-log
+bot/status.py            on the laptop: is the bot running and reading the game? (run as `mechbot`)
+mechbot.cmd              the short `mechbot` command: status, `mechbot restart`, `mechbot log`
 bot/phone_check.py       checks that every line of both boards fits on a phone without wrapping
 server-setup/            one-off Discord REST scripts, run by hand
   discord_api.py           small REST client used by the scripts
