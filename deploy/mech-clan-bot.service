@@ -1,0 +1,17 @@
+# Runs Mech Clan Bot on the Oracle Cloud server (Always Free VM, Ubuntu 24.04, user ubuntu), since 2026-11-04.
+# A fixed IP means the Clash API key never has to change, unlike on the laptop (home vs university).
+# Install: sudo cp deploy/mech-clan-bot.service /etc/systemd/system/ && sudo systemctl enable --now mech-clan-bot
+[Unit]
+Description=Mech Clan Bot (Discord bot for the Clash of Clans clan mech clan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/mech-clan
+ExecStart=/home/ubuntu/mech-clan/.venv/bin/python bot/mech_bot.py
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

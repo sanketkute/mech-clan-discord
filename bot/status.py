@@ -4,8 +4,12 @@ mechbot.cmd in the repo root, which is on the user's PATH:
     mechbot restart    restart it, wait for its first check, then show the status
     mechbot log        the last 20 lines of bot.log
 It reads what the running bot leaves behind: its lock port (held while it runs), bot_state.json (saved after every
-check, with the health of the last checks) and bot.log (Discord connection and errors). Exits with 1 on a problem."""
+check, with the health of the last checks) and bot.log (Discord connection and errors). Exits with 1 on a problem.
+
+Since 2026-11-04 the bot runs on an Oracle Cloud server. With BOT_SERVER (user@host) and BOT_SSH_KEY in the laptop's
+.env, mechbot on the laptop runs this same script on the server over SSH. On the server, restart uses systemd."""
 import json
+import os
 import re
 import socket
 import subprocess
@@ -15,7 +19,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
-TASK = 'Mech Clan Bot'  # the Windows scheduled task that runs the bot
+TASK = 'Mech Clan Bot'  # the Windows scheduled task that runs the bot on the laptop
+SERVICE = 'mech-clan-bot'  # the systemd service that runs it on the server (deploy/mech-clan-bot.service)
 LOCK_PORT = 47831  # mech_bot.py holds this local port while it runs
 CHECK_EVERY = timedelta(minutes=1)
 LOG_LINE = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ (\w+) ([\w.]+): (.*)')
@@ -61,13 +66,17 @@ def restart():
         subprocess.run(['powershell', '-NoProfile', '-Command', f"{action}-ScheduledTask '{TASK}'"], check=True)
 
     print('Restarting the bot...', flush=True)
-    task('Stop')
-    for _ in range(30):
-        if not running():
-            break
-        time.sleep(1)
     started = time.time()
-    task('Start')
+    if os.name == 'nt':
+        task('Stop')
+        for _ in range(30):
+            if not running():
+                break
+            time.sleep(1)
+        started = time.time()
+        task('Start')
+    else:  # systemd waits for the old copy to exit before it starts the new one
+        subprocess.run(['sudo', 'systemctl', 'restart', SERVICE], check=True)
     state_file = ROOT / 'bot_state.json'
     for _ in range(120):  # the first check usually lands within 20 seconds
         time.sleep(1)
@@ -83,7 +92,28 @@ def show_log(count=20):
     print('\n'.join(lines[-count:]))
 
 
+def server():
+    """(user@host, key path) from the laptop's .env when the bot runs on the server, else None."""
+    if os.name != 'nt':
+        return None
+    try:
+        env = dict(line.split('=', 1) for line in (ROOT / '.env').read_text(encoding='utf-8').splitlines()
+                   if '=' in line and not line.lstrip().startswith('#'))
+    except OSError:
+        return None
+    host = env.get('BOT_SERVER', '').strip()
+    return (host, env.get('BOT_SSH_KEY', '').strip()) if host else None
+
+
 def main(args):
+    remote = server()
+    if remote:
+        host, key = remote
+        command = 'cd ~/mech-clan && .venv/bin/python bot/status.py ' + ' '.join(args[:1])
+        # BatchMode: fail with a message instead of waiting for input; accept-new: trust the server's host key on the
+        # first connection (Windows' ssh keeps its own list), but refuse if it ever changes.
+        options = ['-o', 'ConnectTimeout=15', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new']
+        return subprocess.run(['ssh', *options] + (['-i', key] if key else []) + [host, command]).returncode
     if args == ['log']:
         show_log()
         return 0

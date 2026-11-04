@@ -28,13 +28,15 @@ from discord import app_commands
 from discord.ext import tasks
 from discord.http import Route
 
+from cwl_group import build_cwl_group, round_view
 from donation_board import build_donation_board
-from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail
+from war_board import IS_COMPONENTS_V2, attack_line, attack_log, build_board, detail, plural
 
 ROOT = Path(__file__).parent.parent  # the repo root, which holds .env, posts/ and the bot's local files
 GUILD = discord.Object(id=1316103480644993116)
 CLAN = '#YU9YY8UV'
 STATE_FILE = ROOT / 'bot_state.json'
+LINKS_FILE = ROOT / 'links.json'  # player tag -> Discord user id, from /link; local only, like the state
 RULES_FILE = ROOT / 'posts' / 'rules.md'
 
 ROLES = {'member': 'Member', 'admin': 'Elder', 'coLeader': 'Co-Leader', 'leader': 'Leader'}
@@ -42,11 +44,19 @@ RANK = list(ROLES)
 # Game art comes from ClashKing Assets (assets.clashk.ing, credited in the bot's About Me). Small icons were
 # uploaded as the bot's own emojis on 2026-10-23 (th1-th18, bk, aq, gw, rc, mp, dd, xp, war_star, no_star, ...);
 # bigger pictures are linked straight from the asset site.
-# The live war board (war_board.py) is on trial in #leaders since 2026-10-24; the per-attack cards in #war-log
-# keep running until the owner moves the board there.
-BOARD_CHANNEL = 'leaders'
+# The live war board (war_board.py), on trial in #leaders from 2026-10-24, moved to #war-log on 2026-11-04 (owner's
+# yes). It replaces the per-attack cards there, which ATTACK_CARDS turns back on.
+BOARD_CHANNEL = 'war-log'
+ATTACK_CARDS = False
 BADGE_HOST = 'https://api-assets.clashofclans.com/'  # opponent badges are only fetched from Supercell's server
 SUPPRESS_NOTIFICATIONS = 1 << 12  # message flag, the same as starting a message with @silent
+EPHEMERAL = 1 << 6  # message flag: only the person who tapped a button sees the answer
+CWL_CHANNEL = 'cwl'  # the live CWL group card (cwl_group.py, the owner's pick on 2026-11-04)
+# War reminders in #war-log, before the war ends (owner's choice, 2026-11-04), pinging members linked with /link.
+# Off for now: the owner kept ClashPerk's reminders, which run in the cloud and so still come when this laptop is
+# off. True turns ours on (and the /link commands with them); then remove ClashPerk's war reminders.
+WAR_REMINDERS_ON = False
+WAR_REMINDERS = {timedelta(hours=6): '6 hours', timedelta(hours=2): '2 hours', timedelta(minutes=30): '30 minutes'}
 # Health (owner's yes, 2026-11-02): the bot's status turns yellow after STATUS_AFTER of failed checks, and #leaders
 # gets an alert after ALERT_AFTER.
 STATUS_AFTER, ALERT_AFTER = timedelta(minutes=5), timedelta(minutes=10)
@@ -116,10 +126,22 @@ def load_state():
         return {}
 
 
-def save_state(state):
-    tmp = STATE_FILE.with_suffix('.tmp')
+def save_state(state, path=STATE_FILE):
+    tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(state, indent=1), encoding='utf-8')
-    tmp.replace(STATE_FILE)
+    tmp.replace(path)
+
+
+def load_links():
+    try:
+        return json.loads(LINKS_FILE.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return {}
+
+
+def clean_tag(text):
+    """'2pcy2yppy' or '#2PCY2YPPY' -> '#2PCY2YPPY'. Tags never contain the letter O, so it's read as zero."""
+    return '#' + text.strip().upper().lstrip('#').replace('O', '0')
 
 
 def api_time(value):
@@ -181,6 +203,9 @@ class MechClanBot(discord.Client):
         self.state = load_state()
         self.icons = {}
         self.live_wars = {}  # war id -> latest war JSON, for the board's buttons
+        self.cwl_wars = {}  # CWL war tag -> war JSON, kept once the war has ended so it isn't fetched again
+        self.cwl_group = None  # (group, started wars) of the CWL season, for the round buttons
+        self.links = load_links()  # player tag -> Discord user id, for war reminder pings
 
     async def setup_hook(self):
         await self.tree.sync(guild=GUILD)
@@ -206,9 +231,15 @@ class MechClanBot(discord.Client):
         self.presence = None  # a new gateway session starts from WATCHING, so the next poll sends the status again
 
     async def on_interaction(self, interaction):
-        """The war board's buttons (custom id wb:<what>:<war id>): answer privately with the details."""
+        """The war board's buttons (custom id wb:<what>:<war id>) and the CWL card's round buttons (cwl:round:<n>):
+        answer privately with the details."""
         custom_id = (interaction.data or {}).get('custom_id', '')
-        if interaction.type != discord.InteractionType.component or not custom_id.startswith('wb:'):
+        if interaction.type != discord.InteractionType.component:
+            return
+        if custom_id.startswith('cwl:round:'):
+            await self.answer_cwl_round(interaction, int(custom_id.rsplit(':', 1)[1]))
+            return
+        if not custom_id.startswith('wb:'):
             return
         _, what, war_id = custom_id.split(':', 2)
         war = self.live_wars.get(war_id)
@@ -218,6 +249,18 @@ class MechClanBot(discord.Client):
             return
         title, body = detail(war, CLAN, what, self.icon)
         await interaction.response.send_message(embed=self.card(BLUE, title, body), ephemeral=True)
+
+    async def answer_cwl_round(self, interaction, number):
+        """One round of the CWL group, privately, as Components V2 (sent raw: discord.py builds V2 only from views)."""
+        if self.cwl_group is None:
+            data = {'content': 'The bot is still loading the CWL group. Try again in a minute.', 'flags': EPHEMERAL}
+        else:
+            group, wars = self.cwl_group
+            data = {'flags': IS_COMPONENTS_V2 | EPHEMERAL, 'allowed_mentions': {'parse': []},
+                    'components': round_view(group, wars, number, CLAN, self.icon)}
+        await self.http.request(Route('POST', '/interactions/{interaction_id}/{interaction_token}/callback',
+                                      interaction_id=interaction.id, interaction_token=interaction.token),
+                                json={'type': 4, 'data': data})
 
     def channel(self, name):
         return discord.utils.get(self.get_guild(GUILD.id).channels, name=name)
@@ -240,7 +283,7 @@ class MechClanBot(discord.Client):
     @tasks.loop(seconds=60)
     async def poll(self):
         failure = None  # (short reason, details) of the first check that failed
-        for check in (self.check_clan, self.check_war):
+        for check in (self.check_clan, self.check_war, self.check_cwl_group):
             try:
                 await check()
             except coc.Maintenance:
@@ -249,7 +292,13 @@ class MechClanBot(discord.Client):
             except Exception as error:
                 log.exception('%s failed', check.__name__)
                 failure = failure or (failure_reason(error), str(error))
-        await self.update_health(failure)
+        try:
+            await self.update_health(failure)
+        except Exception:
+            # Discord can drop mid-update (2026-11-04 09:02: "Cannot write to closing transport" while setting the
+            # status); the checks are done, so save them anyway, and the next poll sends the status again.
+            log.exception('health update failed')
+            self.presence = None
         save_state(self.state)
 
     async def update_health(self, failure):
@@ -474,6 +523,11 @@ class MechClanBot(discord.Client):
                 seen = seen_wars[war_id] = {'state': war['state'] if first_run else None,
                                             'order': attacks[-1][0]['order'] if first_run and attacks else 0}
             await self.report_war(war, us, them, seen, attacks)
+            if war['state'] == 'inWar' and WAR_REMINDERS_ON:
+                try:
+                    await self.remind_war(war, us, seen, first_run)
+                except Exception:
+                    log.exception('war reminder failed for %s', war_id)
             try:
                 await self.update_board(war, us, them, war_id)
             except Exception:
@@ -488,12 +542,107 @@ class MechClanBot(discord.Client):
         for war_id in [w for w in boards if api_time(w[:20]) < cutoff]:
             await self.remove_opponent_badge(boards.pop(war_id).get('emoji'))
 
+    async def remind_war(self, war, us, seen, first_run):
+        """Ping the players who still have attacks, at each WAR_REMINDERS time before the war ends. A reminder the
+        bot was too late for (it was off) is folded into the next one; one that fails to send is tried again."""
+        left = api_time(war['endTime']) - datetime.now(timezone.utc)
+        sent = seen.setdefault('reminded', [])
+        due = [t for t in WAR_REMINDERS if left <= t and t.total_seconds() not in sent]
+        if not due:
+            return
+        per_member = war.get('attacksPerMember') or (1 if war.get('_cwl_tag') else 2)
+        waiting = [(m, per_member - len(m.get('attacks', []))) for m in sorted(us.get('members', []),
+                                                                                key=lambda m: m['mapPosition'])]
+        waiting = [(m, n) for m, n in waiting if n > 0]
+        if waiting and not first_run and left > timedelta(0):
+            nearest = min(due)
+            when = WAR_REMINDERS[nearest] if nearest - left < timedelta(minutes=5) else duration(left)
+            kind = f"CWL round {war['_round']}" if war.get('_cwl_tag') else 'War'
+            # Plain text, no markdown: the first line is what the phone notification shows.
+            lines = [f"{kind} ends in {when}: {plural(sum(n for _, n in waiting), 'attack')} left"]
+            by_user, unlinked = {}, []
+            for member, n in waiting:
+                name = member['name'] + (f' ({n})' if per_member > 1 else '')
+                user = self.links.get(member['tag'])
+                (by_user.setdefault(user, []) if user else unlinked).append(name)
+            lines += [f"<@{user}> {', '.join(names)}" for user, names in by_user.items()]
+            if unlinked:
+                lines.append(f"Not linked: {', '.join(unlinked)}. Use /link to get pinged.")
+            await self.channel('war-log').send('\n'.join(lines)[:2000], allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=True))
+        sent += [t.total_seconds() for t in due]
+
+    async def check_cwl_group(self):
+        """Keep the live CWL group card in #cwl: posted silently and pinned once round 1's battle day starts, then
+        edited every minute, and left alone once the season has ended. Ended wars are kept, so a poll only fetches
+        the rounds still being fought."""
+        try:
+            group = await self.coc.http.get_clan_war_league_group(CLAN)
+        except coc.NotFound:
+            return  # not in CWL
+        if group.get('state') in (None, 'notInWar'):
+            return
+        card = self.state.setdefault('cwl_card', {})
+        if card.get('season') != group['season']:
+            if card.get('message'):  # last season's card stays in #cwl, but no longer pinned
+                try:
+                    await self.http.request(Route('DELETE', '/channels/{channel_id}/pins/{message_id}',
+                                                  channel_id=card['channel'], message_id=card['message']))
+                except discord.HTTPException:
+                    log.warning('could not unpin the CWL card of %s', card['season'])
+            card.clear()
+            card['season'] = group['season']
+            self.cwl_wars = {}
+        if card.get('final') and self.cwl_group is not None:
+            return
+        tags = [(number, tag) for number, round_ in enumerate(group.get('rounds', []), start=1)
+                for tag in round_['warTags'] if tag != '#0']
+        fetched = await asyncio.gather(*(self.coc.http.get_cwl_wars(tag) for _, tag in tags
+                                         if tag not in self.cwl_wars))
+        new = iter(fetched)
+        wars, round_number = [], 0
+        for number, tag in tags:
+            war = self.cwl_wars.get(tag) or next(new)
+            war['_round'] = number
+            if war['state'] == 'warEnded':
+                self.cwl_wars[tag] = war
+            if war['state'] in ('inWar', 'warEnded'):
+                wars.append(war)
+                round_number = number
+        self.cwl_group = group, wars
+        if not wars or card.get('final'):
+            return  # nothing fought yet, or the finished card only needed its round buttons back after a restart
+        league = CWL_LEAGUES.get(self.state.get('war_league_id'), ('CWL',))[0]
+        body = {'flags': IS_COMPONENTS_V2, 'allowed_mentions': {'parse': []},
+                'components': build_cwl_group(group, wars, CLAN, self.icon, league, league_badge(league), round_number,
+                                              updated=int(datetime.now(timezone.utc).timestamp()))}
+        if card.get('message'):
+            try:
+                await self.http.request(Route('PATCH', '/channels/{channel_id}/messages/{message_id}',
+                                              channel_id=card['channel'], message_id=card['message']), json=body)
+                card['final'] = group['state'] == 'ended'
+                return
+            except discord.NotFound:
+                log.warning('CWL card %s was deleted, posting a new one', card['message'])
+        channel = self.channel(CWL_CHANNEL)
+        message = await self.http.request(Route('POST', '/channels/{channel_id}/messages', channel_id=channel.id),
+                                          json={**body, 'flags': IS_COMPONENTS_V2 | SUPPRESS_NOTIFICATIONS})
+        card['channel'], card['message'] = str(channel.id), message['id']
+        card['final'] = group['state'] == 'ended'
+        try:  # pinned, so it can be found once chat has pushed it up
+            await self.http.request(Route('PUT', '/channels/{channel_id}/pins/{message_id}',
+                                          channel_id=channel.id, message_id=message['id']))
+        except discord.HTTPException:
+            log.exception('could not pin the CWL card')
+
     async def update_board(self, war, us, them, war_id):
         """Create or edit the war's board in BOARD_CHANNEL, and post new attacks to the board's thread."""
         boards = self.state.setdefault('boards', {})
         board = boards.get(war_id)
         if board and board.get('final'):
             return
+        if board and board['channel'] != str(self.channel(BOARD_CHANNEL).id):
+            board = None  # BOARD_CHANNEL changed: post the running war's board, with its full thread, there
         emoji = 'opp_' + them['tag'].lstrip('#').lower()
         if emoji not in self.icons:
             await self.add_opponent_badge(emoji, them)
@@ -590,7 +739,7 @@ class MechClanBot(discord.Client):
             await channel.send(embed=embed)
 
         new = [pair for pair in attacks if pair[0]['order'] > seen['order']]
-        if new:
+        if new and ATTACK_CARDS:
             for ours, title, color in ((True, 'Our attacks', GREEN), (False, 'Enemy attacks', RED)):
                 lines = []
                 for attack, side in new:
@@ -605,6 +754,7 @@ class MechClanBot(discord.Client):
                     embed = self.card(color, title, '\n'.join(lines)[:4000])
                     embed.set_footer(text=score)
                     await channel.send(embed=embed)
+        if new:  # counted even with the cards off, so turning them on doesn't post every old attack
             seen['order'] = new[-1][0]['order']
 
         if changed and war['state'] == 'warEnded':
@@ -730,6 +880,74 @@ async def rules(interaction: discord.Interaction, part: app_commands.Choice[str]
     if bot.state.get('badge'):
         embed.set_thumbnail(url=bot.state['badge'])
     await interaction.response.send_message(embed=embed)
+
+
+# Links between villages and Discord members, so war reminders can ping the right person (2026-11-04). Anyone can
+# link a free village to themselves; taking over a village linked to someone else needs its in-game API token,
+# and only leaders (Manage Server) can link for someone else, as in ClashPerk.
+@bot.tree.command(name='link', description='Link your Clash village, so war reminders ping you', guild=GUILD)
+@app_commands.describe(player_tag='The village tag, like #2PCY2YPPY',
+                       user='Leaders only: link the village to this member instead',
+                       api_token='Only if the village is linked to someone else: Settings > More Settings > API token')
+async def link(interaction: discord.Interaction, player_tag: str, user: Optional[discord.Member] = None,
+               api_token: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    tag, target = clean_tag(player_tag), user or interaction.user
+    leader = interaction.user.guild_permissions.manage_guild
+    if target.id != interaction.user.id and not leader:
+        await interaction.followup.send('Only leaders can link a village to someone else.')
+        return
+    try:
+        player = await bot.coc.http.get_player(tag)
+    except coc.NotFound:
+        await interaction.followup.send(f"There's no village with the tag {tag}.")
+        return
+    owner = bot.links.get(tag)
+    if owner and owner != str(target.id) and not leader:
+        if not api_token or not await bot.coc.verify_player_token(tag, api_token):
+            await interaction.followup.send(
+                f"**{player['name']}** is linked to someone else. To take it over, add its API token: in game, "
+                'Settings > More Settings > API token.')
+            return
+    bot.links[tag] = str(target.id)
+    save_state(bot.links, LINKS_FILE)
+    await interaction.followup.send(f"Linked **{player['name']}** ({tag}, TH{player['townHallLevel']}) to "
+                                    f"{target.mention}. War reminders will ping them when it has attacks left.",
+                                    allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name='unlink', description='Unlink a Clash village from its Discord member', guild=GUILD)
+@app_commands.describe(player_tag='The village tag, like #2PCY2YPPY')
+async def unlink(interaction: discord.Interaction, player_tag: str):
+    tag = clean_tag(player_tag)
+    owner = bot.links.get(tag)
+    if owner is None:
+        await interaction.response.send_message(f'{tag} isn\'t linked.', ephemeral=True)
+    elif owner != str(interaction.user.id) and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message('Only its member or a leader can unlink that village.',
+                                                ephemeral=True)
+    else:
+        del bot.links[tag]
+        save_state(bot.links, LINKS_FILE)
+        await interaction.response.send_message(f'Unlinked {tag}.', ephemeral=True)
+
+
+@bot.tree.command(name='links', description='Show which villages are linked to a member', guild=GUILD)
+@app_commands.describe(user='Defaults to you')
+async def links(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    target = user or interaction.user
+    members = bot.state.get('members', {})
+    tags = [tag for tag, owner in bot.links.items() if owner == str(target.id)]
+    lines = [f"{members[tag]['name']} ({tag}, TH{members[tag]['th']})" if tag in members else f'{tag} (not in the clan)'
+             for tag in tags]
+    await interaction.response.send_message(
+        f"{target.mention} has {plural(len(tags), 'linked village')}" + (':\n' + '\n'.join(lines) if lines else '.')
+        + ('' if lines else ' Link one with /link.'), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+if not WAR_REMINDERS_ON:  # links only serve our reminders; while ClashPerk's run, members use ClashPerk's /link
+    for command in ('link', 'unlink', 'links'):
+        bot.tree.remove_command(command, guild=GUILD)
 
 
 if __name__ == '__main__':

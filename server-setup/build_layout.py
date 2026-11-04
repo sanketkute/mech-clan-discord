@@ -35,6 +35,7 @@ ROLES = [
 ]
 
 READ_ONLY = bits('SEND_MESSAGES', 'SEND_MESSAGES_IN_THREADS', 'CREATE_PUBLIC_THREADS', 'CREATE_PRIVATE_THREADS')
+CLASHPERK_POSTS_IN = {'war-log'}  # bots-only channels where ClashPerk may post (its war reminders)
 
 # (category, [(name, type, topic, access)]). type: 0 text, 2 voice, 5 announcement, 15 forum.
 # access: 'open', 'read-only' (only leaders post), 'bots' (only bots post), 'leaders' (only leaders see it).
@@ -87,14 +88,16 @@ def ensure_roles():
     return {name: existing[name]['id'] for name in [n for n, _, _, _ in ROLES] + ['ClashPerk'] if name in existing}
 
 
-def overwrites(access, roles):
+def overwrites(access, roles, name=''):
     leaders = [roles['Leader'], roles['Co-Leader'], roles['Moderator']]
     if access == 'read-only':
         return [{'id': GUILD, 'type': 0, 'allow': '0', 'deny': READ_ONLY},
                 {'id': roles['Moderator'], 'type': 0, 'allow': READ_ONLY, 'deny': '0'}]
     if access == 'bots':
-        # ClashPerk has no Administrator and checks Send Messages before it posts a log.
-        clash_bot = [{'id': roles['ClashPerk'], 'type': 0, 'allow': bits('SEND_MESSAGES'), 'deny': '0'}] if 'ClashPerk' in roles else []
+        # ClashPerk has no Administrator and checks Send Messages before it posts. Since 2026-11-04 it only posts
+        # its war reminders here in #war-log; its logs are off and Mech Clan Bot does #clan-log.
+        clash_bot = ([{'id': roles['ClashPerk'], 'type': 0, 'allow': bits('SEND_MESSAGES'), 'deny': '0'}]
+                     if 'ClashPerk' in roles and name in CLASHPERK_POSTS_IN else [])
         return [{'id': GUILD, 'type': 0, 'allow': '0', 'deny': READ_ONLY}] + clash_bot
     if access == 'leaders':
         return [{'id': GUILD, 'type': 0, 'allow': '0', 'deny': bits('VIEW_CHANNEL')}] + [
@@ -104,7 +107,7 @@ def overwrites(access, roles):
 
 def ensure_channel(existing, name, ch_type, parent, topic, access, roles, position):
     body = {'name': name, 'type': ch_type, 'parent_id': parent, 'position': position,
-            'permission_overwrites': overwrites(access, roles)}
+            'permission_overwrites': overwrites(access, roles, name)}
     if topic:
         body['topic'] = topic
     if ch_type == 15:

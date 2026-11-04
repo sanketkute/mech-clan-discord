@@ -17,10 +17,15 @@ It checks the clan through the official Clash of Clans API every minute and post
   `bot/mech_bot.py` switches it off)
 - **#war-log:** war declared, battle day, every attack (ours and theirs) and the result with missed attacks,
   for regular wars and Clan War League
+- **#cwl:** during Clan War League, one pinned card with the 8 clans of our group, ranked by stars, with each clan's
+  attacks this round and the Town Halls of its lineup. Buttons 1-7 show a round's results to whoever taps them.
+
+War reminders (6 h, 2 h and 30 min before a war ends, pinging members linked with `/link`) are built in but off
+(`WAR_REMINDERS_ON` in `bot/mech_bot.py`); the clan uses ClashPerk's reminders and links.
 
 Its Discord status shows whether it can read the game: green "Watching mech clan" while the checks work, yellow
 "No game data since 17:21" after 5 minutes of failed checks. After 10 minutes it also posts an alert in #leaders,
-and an all-clear once the checks work again. On the laptop itself, `mechbot` shows whether the bot is running, when it
+and an all-clear once the checks work again. From a terminal, `mechbot` shows whether the bot is running, when it
 last checked the game, its Discord connection and recent errors; `mechbot restart` restarts it and `mechbot log`
 shows the end of its log. That needs the repo folder on the PATH; without it, run `mechbot.cmd` from the repo.
 
@@ -38,7 +43,9 @@ Slash commands:
 bot/mech_bot.py          the bot
 bot/war_board.py         the live war board: one message per war, edited every minute, with an attack thread
 bot/donation_board.py    the daily donation board: top donors of the day, posted silently in #clan-log
-bot/status.py            on the laptop: is the bot running and reading the game? (run as `mechbot`)
+bot/cwl_group.py         the live CWL group card in #cwl and the round results behind its buttons
+bot/status.py            is the bot running and reading the game? (run as `mechbot`, also from the laptop over SSH)
+deploy/                  the systemd service that runs the bot on the server
 mechbot.cmd              the short `mechbot` command: status, `mechbot restart`, `mechbot log`
 bot/phone_check.py       checks that every line of both boards fits on a phone without wrapping
 server-setup/            one-off Discord REST scripts, run by hand
@@ -78,8 +85,12 @@ and server backups.
 ```
 
 On first start it only records the current clan and war, so nothing old gets posted. Only one copy can run at a
-time (it holds local port 47831), so logs are never posted twice. On Windows we run it with
-`.venv\Scripts\pythonw.exe` from a Task Scheduler task that starts at logon and restarts it on failure.
+time (it holds local port 47831), so logs are never posted twice on one machine; never run it on two machines.
+
+It runs on a free Oracle Cloud server (Ubuntu) as the systemd service in `deploy/mech-clan-bot.service`, which starts
+it at boot and restarts it if it stops. A server keeps one IP address, so its Clash API key never has to change; on a
+laptop that moves between networks, the key kept getting refused for hours. With `BOT_SERVER` and `BOT_SSH_KEY` in the
+laptop's `.env`, `mechbot` on the laptop checks and restarts the bot on the server over SSH.
 
 The server setup scripts are run from the repo root, for example `python server-setup/post_info.py`. They're safe
 to re-run unless the file says otherwise.
