@@ -60,6 +60,7 @@ WAR_REMINDERS = {timedelta(hours=6): '6 hours', timedelta(hours=2): '2 hours', t
 # Health (owner's yes, 2026-11-02): the bot's status turns yellow after STATUS_AFTER of failed checks, and #leaders
 # gets an alert after ALERT_AFTER.
 STATUS_AFTER, ALERT_AFTER = timedelta(minutes=5), timedelta(minutes=10)
+MAINTENANCE_QUIET = timedelta(hours=6)  # maintenance gets no alert, unless it lasts longer than this
 MAINTENANCE = 'Clash of Clans is down for maintenance'
 WATCHING = discord.Activity(type=discord.ActivityType.watching, name='mech clan')
 IP_ADDRESS = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}\b')
@@ -173,7 +174,9 @@ def failure_reason(error):
     if isinstance(error, coc.Forbidden):
         return 'Supercell refused the API key'
     if isinstance(error, (aiohttp.ClientConnectionError, socket.gaierror, asyncio.TimeoutError)):
-        return "The laptop can't reach the Clash API (no internet?)"
+        return "The server can't reach the Clash API (no internet?)"
+    if isinstance(error, coc.GatewayError):
+        return "Supercell's servers are answering with errors (often around maintenance)"
     return f'Unexpected error: {type(error).__name__}'
 
 
@@ -288,10 +291,13 @@ class MechClanBot(discord.Client):
                 await check()
             except coc.Maintenance:
                 log.info('Clash API maintenance, skipping %s', check.__name__)
-                failure = failure or (MAINTENANCE, 'The Clash API is down for maintenance.')
+                # Maintenance wins: during it, other endpoints can answer with plain 500s instead (2026-11-18:
+                # clan and war gave "unknownException (500)", the CWL group "maintenance"), and that's no alert.
+                failure = (MAINTENANCE, 'The Clash API is down for maintenance.')
             except Exception as error:
                 log.exception('%s failed', check.__name__)
-                failure = failure or (failure_reason(error), str(error))
+                if failure is None or failure[0] != MAINTENANCE:
+                    failure = failure or (failure_reason(error), str(error))
         try:
             await self.update_health(failure)
         except Exception:
@@ -317,11 +323,18 @@ class MechClanBot(discord.Client):
             await self.show_health()
             return
         reason, details = failure
+        if reason == MAINTENANCE:
+            health['maintenance'] = True
+        elif health.get('maintenance'):
+            # Once maintenance showed up in this run, the plain 500s around it are part of it (2026-11-18: most
+            # replies were "unknownException (500)", only some said maintenance).
+            reason = MAINTENANCE
         health['reason'] = reason  # for bot/status.py
         since = datetime.fromisoformat(health.setdefault('since', now.isoformat()))
         if now - since >= STATUS_AFTER:
             await self.show_health(reason, since)
-        if now - since >= ALERT_AFTER and reason != MAINTENANCE and not health.get('alerted'):
+        quiet = reason == MAINTENANCE and now - since < MAINTENANCE_QUIET
+        if now - since >= ALERT_AFTER and not quiet and not health.get('alerted'):
             embed = self.card(RED, "Mech Clan Bot can't read the game",
                               f'Clan and war checks have failed since {clock(since)}. {reason}.')
             embed.add_field(name='Details', value=IP_ADDRESS.sub('<laptop IP>', details)[:1000] or '-')
