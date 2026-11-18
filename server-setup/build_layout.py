@@ -62,7 +62,7 @@ LAYOUT = [
         ('Clan Voice', 2, None, 'open'),
     ]),
 ]
-FORUM_TAGS = [f'TH{n}' for n in range(11, 19)]  # only used when creating #bases; bases_posts.py manages them after that
+FORUM_TAGS = [f'TH{n}' for n in range(11, 20)]  # only used when creating #bases; bases_posts.py manages them after that
 
 
 def ensure_roles():

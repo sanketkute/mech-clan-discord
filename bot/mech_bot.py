@@ -42,8 +42,8 @@ RULES_FILE = ROOT / 'posts' / 'rules.md'
 ROLES = {'member': 'Member', 'admin': 'Elder', 'coLeader': 'Co-Leader', 'leader': 'Leader'}
 RANK = list(ROLES)
 # Game art comes from ClashKing Assets (assets.clashk.ing, credited in the bot's About Me). Small icons were
-# uploaded as the bot's own emojis on 2026-10-23 (th1-th18, bk, aq, gw, rc, mp, dd, xp, war_star, no_star, ...);
-# bigger pictures are linked straight from the asset site.
+# uploaded as the bot's own emojis on 2026-10-23 (th1-th18, bk, aq, gw, rc, mp, dd, xp, war_star, no_star, ...),
+# and th19 on 2026-11-18, after TH19 came out; bigger pictures are linked straight from the asset site.
 # The live war board (war_board.py), on trial in #leaders from 2026-10-24, moved to #war-log on 2026-11-04 (owner's
 # yes). It replaces the per-attack cards there, which ATTACK_CARDS turns back on.
 BOARD_CHANNEL = 'war-log'
@@ -875,8 +875,7 @@ async def bases(interaction: discord.Interaction, town_hall: app_commands.Range[
         return
     embed = bot.card(BLUE, f'Town Hall {town_hall} bases', f'{bot.th(town_hall)} War, CWL, legend and farming bases. '
                                                            f'Share yours there with `/layout post`.')
-    if town_hall <= 18:  # no TH19 picture in ClashKing Assets yet
-        embed.set_thumbnail(url=TH_IMAGE.format(town_hall))
+    embed.set_thumbnail(url=TH_IMAGE.format(town_hall))
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label=f'Open TH{town_hall} bases', url=post.jump_url,
                                     emoji=bot.icon(f'th{town_hall}') or None))
